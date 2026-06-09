@@ -1,0 +1,19 @@
+# Secrets / local config
+.env
+
+# Python
+*/__pycache__/
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.claude/
+.idea/
+
+# Experiment artifacts
+/models/
+wandb/
+*.pt
+*.pkl
