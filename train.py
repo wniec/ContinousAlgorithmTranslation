@@ -27,7 +27,7 @@ from cat.suite.bbob_splits import (
     EASY_TRAIN_FUNCTIONS,
     build_problem_ids,
 )
-from cat.train_loop import TrainConfig, save_translator, train
+from cat.train_loop import TrainConfig, resolve_device, save_translator, train
 
 
 def build_train_ids(
@@ -68,7 +68,11 @@ def parse_args():
     p.add_argument("--w-cycle", type=float, default=1.0)
     p.add_argument("--w-recon", type=float, default=1.0)
     p.add_argument("--w-utility", type=float, default=0.1)
-    p.add_argument("--device", default="cpu")
+    p.add_argument(
+        "--device",
+        default="auto",
+        help="'auto' uses CUDA when available else CPU; or pass cuda / cuda:0 / cpu / mps",
+    )
     p.add_argument("--seed", type=int, default=42)
     # io
     p.add_argument(
@@ -88,6 +92,8 @@ def main():
     args = parse_args()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    args.device = resolve_device(args.device)
+    print(f"[device] using {args.device}")
 
     if args.cache and os.path.exists(args.cache):
         print(f"loading cached snapshots from {args.cache}")

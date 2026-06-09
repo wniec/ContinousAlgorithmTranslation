@@ -12,6 +12,22 @@ from cat.models.norm import NormContext
 from cat.models.translator import TranslatorPair
 
 
+def resolve_device(name: str = "auto") -> str:
+    """Resolve a device string. ``"auto"`` picks CUDA when available, else CPU.
+
+    An explicit ``"cuda"`` that isn't available falls back to CPU with a warning
+    (so a CUDA command line still runs on a CPU-only box). Apple MPS is only used
+    when requested explicitly — several linalg ops we rely on (cholesky/eigh)
+    have spotty MPS support.
+    """
+    if name and name != "auto":
+        if name.startswith("cuda") and not torch.cuda.is_available():
+            print(f"[device] {name!r} requested but CUDA is unavailable; using cpu")
+            return "cpu"
+        return name
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 @dataclass
 class TrainConfig:
     epochs: int = 20

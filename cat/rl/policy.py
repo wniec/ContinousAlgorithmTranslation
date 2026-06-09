@@ -102,7 +102,9 @@ class ActorCritic(nn.Module):
 
         native = self._assemble_native(action, target, batch, ctx)
         return Step(
-            src_state=src,
+            # Keep the buffered state on CPU so a long rollout doesn't accumulate
+            # GPU tensors; it is moved back to the device during the update.
+            src_state=src.to("cpu"),
             target_algo=target,
             action=action.squeeze(0).cpu(),
             log_prob=float(log_prob.item()),

@@ -28,7 +28,7 @@ from cat.optimizers.portfolio import PORTFOLIO
 from cat.tracking import WandbLogger
 from cat.suite import IOHSuite
 from cat.suite.bbob_splits import ALL_FUNCTIONS, EASY_TRAIN_FUNCTIONS, build_problem_ids
-from cat.train_loop import translator_meta
+from cat.train_loop import resolve_device, translator_meta
 
 
 def build_envs(args) -> list[TranslationEnv]:
@@ -88,7 +88,11 @@ def parse_args():
     p.add_argument("--vf-coef", type=float, default=0.025)
     p.add_argument("--lambda-cycle", type=float, default=0.05)
     p.add_argument("--lr", type=float, default=3e-5)
-    p.add_argument("--device", default="cpu")
+    p.add_argument(
+        "--device",
+        default="auto",
+        help="'auto' uses CUDA when available else CPU; or pass cuda / cuda:0 / cpu / mps",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out", default=None)
     # logging
@@ -104,11 +108,12 @@ def main():
     args = parse_args()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    args.device = resolve_device(args.device)
 
     envs = build_envs(args)
     print(
         f"RL training {args.algo_a}<->{args.algo_b} | dims={args.dims} "
-        f"| {len(envs)} env(s) | n_switches={args.n_switches}"
+        f"| {len(envs)} env(s) | n_switches={args.n_switches} | device={args.device}"
     )
 
     ac = ActorCritic(
