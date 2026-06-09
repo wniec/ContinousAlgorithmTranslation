@@ -97,13 +97,18 @@ python train_rl.py PSO CMAES -d 2 3 5 --n-individuals 12 \
 - **Environment** (`cat/rl/env.py`, a `gymnasium.Env`): one episode is a BBOB run
   with log-sampled switch points; the observation is the source optimizer's
   state, the action is the target optimizer's state (the translation).
-- **Reward** (`--reward-mode`): best-so-far improvement over the segment, scaled
-  by the **initial gap to the global optimum** (best-so-far at the end of the
-  warmup minus the BBOB optimum) and **log-transformed** (so small late-stage
-  improvements near the optimum still register). `absolute` = the log-scaled
-  improvement itself; `relative` = log-scaled improvement **over the lossy
-  default hand-off** run as a counterfactual on the same segment (a sharper,
-  action-isolating signal; ~2× optimizer cost per step).
+- **Reward** (`--reward-mode`, all scaled by the **initial gap to the global
+  optimum** — warmup best-so-far minus the BBOB optimum):
+  - `noswitch` **(default)** — the translation should make the switch
+    *invisible*: each segment is run twice, once with the switch (target
+    optimizer from the translated state) and once **without** (the source
+    optimizer simply continuing), and the reward is the *similarity* of the two,
+    `−|Δ best| / gap` (0 = the switched trajectory matches no-switch exactly).
+  - `absolute` — log-scaled best-so-far improvement over the segment.
+  - `relative` — log-scaled improvement over the lossy default hand-off.
+
+  `noswitch` and `relative` run an extra counterfactual optimizer per step
+  (~2× cost).
 - **Action**: a Gaussian policy over the decoded target fields (covariance
   sampled in factor space → stays PSD).
 - **Critic**: its own encoder (decoupled from the actor) with PPO value-clipping

@@ -66,10 +66,12 @@ def parse_args():
     p.add_argument("--n-individuals", type=int, default=12)
     p.add_argument(
         "--reward-mode",
-        choices=["absolute", "relative"],
-        default="absolute",
-        help="'relative' rewards improvement over the lossy default hand-off "
-        "(sharper, action-isolating signal; ~2x optimizer cost per step)",
+        choices=["noswitch", "absolute", "relative"],
+        default="noswitch",
+        help="'noswitch' (default) rewards matching the no-switch counterfactual "
+        "(the source optimizer continuing); 'absolute' rewards raw improvement; "
+        "'relative' rewards improvement over the lossy default. noswitch/relative "
+        "run an extra counterfactual optimizer per step (~2x cost).",
     )
     # network
     p.add_argument("--hidden", type=int, default=64)

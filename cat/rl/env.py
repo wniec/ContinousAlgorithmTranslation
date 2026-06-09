@@ -13,9 +13,14 @@ the next segment.
   state into a ``CanonicalState`` and encodes it directly; nothing is flattened.
 * **action** — the target's full native warm-start dict (shared population +
   decoded specific fields), assembled by the policy from its decoded state.
-* **reward** — clipped best-so-far improvement over the segment, scaled by an
-  agent-independent random-probe range fixed at reset (prevents reward hacking,
-  mirroring DAS's ``DASEnv``).
+* **reward** — depends on ``reward_mode`` (default ``"noswitch"``):
+    - ``noswitch``: similarity of the switched trajectory to a *no-switch*
+      counterfactual (the source optimizer simply continuing). A perfect
+      translation makes the switch invisible, so reward = ``-|Δ best| / range``
+      (0 == identical to not switching).
+    - ``absolute``: log-scaled best-so-far improvement over the segment.
+    - ``relative``: log-scaled improvement over the lossy default hand-off.
+  All are scaled by the initial gap to the global optimum (fixed at reset).
 
 The observation/action spaces are declared for completeness but the env is meant
 to be driven by the custom loop in ``cat.rl.ppo`` (which reads the structured
@@ -72,13 +77,13 @@ class TranslationEnv(gym.Env):
         fe_multiplier: int = 2000,
         n_switches: int = 6,
         n_individuals: int | None = 12,
-        reward_mode: str = "absolute",
+        reward_mode: str = "noswitch",
         seed: int = 0,
     ):
         super().__init__()
         if not problem_ids:
             raise ValueError("problem_ids is empty")
-        if reward_mode not in ("absolute", "relative"):
+        if reward_mode not in ("noswitch", "absolute", "relative"):
             raise ValueError(f"unknown reward_mode {reward_mode!r}")
         self.algo_a = algo_a
         self.algo_b = algo_b
@@ -222,11 +227,21 @@ class TranslationEnv(gym.Env):
         new_best = result.get("best_so_far_y", prev_best)
         translated_improvement = max(0.0, prev_best - new_best)
 
-        # Compute the reward BEFORE mutating episode state, so the relative
-        # baseline is constructed from the same pre-segment best / FE count.
+        # Compute the reward BEFORE mutating episode state, so every counterfactual
+        # is constructed from the same pre-segment best / FE count.
         rng = max(self._range, 1e-12)
         translated_scaled = float(np.clip(translated_improvement / rng, 0.0, 1.0))
-        if self.reward_mode == "relative":
+        if self.reward_mode == "noswitch":
+            # Counterfactual: continue the *source* optimizer (no switch) from its
+            # own full state over the same segment. Reward closeness of the
+            # switched trajectory's performance to that no-switch performance, so
+            # a perfect translation makes the switch effectively invisible.
+            noswitch_best = self._noswitch_best(target_fe, seg_seed)
+            diff = abs(new_best - noswitch_best)
+            reward = -float(
+                np.clip(diff / rng, 0.0, 1.0)
+            )  # 0 == identical to no-switch
+        elif self.reward_mode == "relative":
             # Counterfactual: run the same target from the *lossy* default hand-off
             # over the same segment (same seed) and reward how much the
             # translated state beat it (in log-scaled units). Isolates exactly
@@ -236,7 +251,7 @@ class TranslationEnv(gym.Env):
             )
             base_scaled = float(np.clip(base_improvement / rng, 0.0, 1.0))
             reward = _log_scale(translated_scaled) - _log_scale(base_scaled)
-        else:
+        else:  # absolute
             reward = _log_scale(translated_scaled)
 
         # Now advance the episode: the target's resulting state becomes the
@@ -253,6 +268,15 @@ class TranslationEnv(gym.Env):
         obs = self._observation()
         # The next observation is valid only if there is another step to take.
         return obs, reward, terminated, False, info
+
+    def _noswitch_best(self, target_fe, seg_seed) -> float:
+        """Best-so-far the *source* optimizer would reach if it simply continued
+        (no switch) from its own full state over the same segment. Counterfactual
+        for the 'noswitch' reward; does not advance the episode."""
+        opt = self._make_optimizer(self._src_algo, target_fe, seg_seed)
+        warm_start_optimizer(opt, self._src_native)
+        result = opt.optimize()
+        return float(result.get("best_so_far_y", float("inf")))
 
     def _baseline_improvement(self, target, target_fe, seg_seed, prev_best) -> float:
         """Improvement a *lossy* hand-off (shared population only) would achieve

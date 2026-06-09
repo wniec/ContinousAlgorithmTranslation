@@ -47,9 +47,7 @@ def test_episode_runs_n_switches_steps():
     env = _env(n_switches=4)
     rewards, steps = _run_episode(env)
     assert steps == 4
-    # Absolute reward is log-scaled improvement: non-negative, finite, unbounded
-    # above by 1 (max is log(1 + 1/eps)).
-    assert all(np.isfinite(r) and r >= 0.0 for r in rewards)
+    assert all(np.isfinite(r) for r in rewards)
 
 
 def test_targets_alternate():
@@ -93,6 +91,32 @@ def test_relative_reward_zero_for_lossy_action():
         obs, r, term, trunc, _ = env.step(_lossy_action(obs))
         assert abs(r) < 1e-9
         done = term or trunc
+
+
+def test_noswitch_reward_bounds_and_sign():
+    """noswitch reward = -|switched - no-switch| / range, in [-1, 0]."""
+    env = TranslationEnv(
+        "PSO",
+        "CMAES",
+        build_problem_ids({1, 2}, dims=[2], instances=[1]),
+        IOHSuite(),
+        fe_multiplier=300,
+        n_switches=4,
+        n_individuals=12,
+        reward_mode="noswitch",
+        seed=5,
+    )
+    obs, _ = env.reset()
+    done = False
+    seen_nonzero = False
+    while not done:
+        obs, r, term, trunc, _ = env.step(_lossy_action(obs))
+        assert -1.0 - 1e-9 <= r <= 1e-9  # in [-1, 0]
+        seen_nonzero = seen_nonzero or r < -1e-9
+        done = term or trunc
+    # A lossy hand-off generally does NOT reproduce continuing the source, so at
+    # least one step should be penalized (reward strictly below 0).
+    assert seen_nonzero
 
 
 def test_log_scaled_reward_properties():
