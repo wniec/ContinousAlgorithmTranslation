@@ -40,7 +40,7 @@ def test_ppo_runs_and_metrics_finite():
     log = train_ppo(ac, _envs(), cfg)
     assert len(log.history) == 2
     for row in log.history:
-        for k in ("policy_loss", "value_loss", "entropy", "cycle", "mean_return"):
+        for k in ("policy_loss", "value_loss", "policy_std", "cycle", "mean_return"):
             assert math.isfinite(row[k]), f"{k} not finite"
         assert row["n_transitions"] >= cfg.rollout_steps
 

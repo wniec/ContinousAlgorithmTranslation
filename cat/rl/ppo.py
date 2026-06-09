@@ -225,7 +225,10 @@ def update(ac: ActorCritic, opt, transitions: list[Transition], cfg: PPOConfig) 
 
                 metrics["policy_loss"] += float(policy_loss.detach())
                 metrics["value_loss"] += float(value_loss.detach())
-                metrics["entropy"] += float(ent.detach())
+                # Log the exploration scale (policy std) rather than the summed
+                # differential entropy: std is sign-stable and independent of the
+                # action dimension, which varies across (PSO/CMA-ES)-target groups.
+                metrics["policy_std"] += float(ac.log_std.exp().mean().detach())
                 metrics["cycle"] += float(cycle.detach())
                 n_batches += 1
 
@@ -262,6 +265,6 @@ def train_ppo(ac: ActorCritic, envs, cfg: PPOConfig, log_fn=None) -> PPOLog:
             print(
                 f"update {u:3d} | return {m['mean_return']:.4f} "
                 f"| pi {m['policy_loss']:.4f} | vf {m['value_loss']:.4f} "
-                f"| ent {m['entropy']:.3f} | cycle {m['cycle']:.4f}"
+                f"| std {m['policy_std']:.4f} | cycle {m['cycle']:.4f}"
             )
     return log
