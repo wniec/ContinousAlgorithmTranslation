@@ -85,12 +85,16 @@ class ActorCritic(nn.Module):
         return to_canonical(obs["source_algo"], obs["native"], device=device)
 
     @torch.no_grad()
-    def act(self, obs: dict, device="cpu", deterministic: bool = False) -> Step:
+    def act(
+        self, obs: dict, device="cpu", deterministic: bool = False, context=None
+    ) -> Step:
         src = self.obs_to_state(obs, device)
         target = obs["target_algo"]
         batch = collate([src])
         ctx = _ctx(batch)
-        context = torch.as_tensor(obs["context"], dtype=torch.float32, device=device)
+        # `context` overrides obs["context"] with the (running-)normalized vector.
+        ctx_vec = obs["context"] if context is None else context
+        context = torch.as_tensor(ctx_vec, dtype=torch.float32, device=device)
 
         z = self.translator.encode(batch, ctx)
         mean = self.translator.decoders[target].action_mean(z, batch.positions, ctx)

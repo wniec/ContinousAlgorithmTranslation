@@ -97,15 +97,23 @@ python train_rl.py PSO CMAES -d 2 3 5 --n-individuals 12 \
 - **Environment** (`cat/rl/env.py`, a `gymnasium.Env`): one episode is a BBOB run
   with log-sampled switch points; the observation is the source optimizer's
   state, the action is the target optimizer's state (the translation).
-- **Reward** (`--reward-mode`): `absolute` = scaled best-so-far improvement over
-  the segment; `relative` = improvement **over the lossy default hand-off** run
-  as a counterfactual on the same segment (a sharper, action-isolating signal —
-  positive only when the translation actually beats the default; ~2× optimizer
-  cost per step).
+- **Reward** (`--reward-mode`): best-so-far improvement over the segment, scaled
+  by the **initial gap to the global optimum** (best-so-far at the end of the
+  warmup minus the BBOB optimum) and **log-transformed** (so small late-stage
+  improvements near the optimum still register). `absolute` = the log-scaled
+  improvement itself; `relative` = log-scaled improvement **over the lossy
+  default hand-off** run as a counterfactual on the same segment (a sharper,
+  action-isolating signal; ~2× optimizer cost per step).
 - **Action**: a Gaussian policy over the decoded target fields (covariance
   sampled in factor space → stays PSD).
 - **Critic**: its own encoder (decoupled from the actor) with PPO value-clipping
   and a Huber loss, so a value-function spike can't swamp the policy gradient.
+- **Normalization** (on by default): rewards are scaled by the running std of the
+  discounted return, and the scalar context observation is standardized by its
+  running mean/std — both persisted across updates so value targets and
+  advantages stay at ~unit scale. The structured optimizer state is already
+  per-sample normalized inside the network (`NormContext`). Disable with
+  `--no-norm-reward` / `--no-norm-obs`. (Logged `return` is always the raw value.)
 - **Cycle-consistency** enters as a differentiable penalty (`--lambda-cycle`),
   keeping the `A→B→A`-minimal condition in the objective.
 - **PPO** (`cat/rl/ppo.py`): a custom loop (no SB3) so it handles variable `D`/`N`

@@ -34,10 +34,29 @@ from cat.optimizers.portfolio import PORTFOLIO
 from cat.state.canonical import warm_start_optimizer
 
 
+# Log-scaling floor. reward = log(scaled + eps) - log(eps) = log(1 + scaled/eps)
+# maps a [0, 1] scaled improvement to [0, log(1 + 1/eps)] (~6.9 for eps=1e-3),
+# with 0 improvement -> 0. Log scaling emphasizes the small improvements that
+# dominate late-stage refinement near the optimum.
+_REWARD_EPS = 1e-3
+
+
 def scaled_improvement(prev_best: float, new_best: float, rng_range: float) -> float:
     """Best-so-far improvement over a segment, scaled to [0, 1]."""
     improvement = max(0.0, prev_best - new_best)
     return float(np.clip(improvement / max(rng_range, 1e-12), 0.0, 1.0))
+
+
+def _log_scale(scaled: float) -> float:
+    """Map a [0, 1] scaled improvement through a log transform (0 -> 0)."""
+    return float(np.log(scaled + _REWARD_EPS) - np.log(_REWARD_EPS))
+
+
+def log_scaled_improvement(
+    prev_best: float, new_best: float, rng_range: float
+) -> float:
+    """Log-scaled best-so-far improvement over a segment."""
+    return _log_scale(scaled_improvement(prev_best, new_best, rng_range))
 
 
 class TranslationEnv(gym.Env):
@@ -165,7 +184,6 @@ class TranslationEnv(gym.Env):
         i_best = int(np.argmin(y_probe))
         self._best_y = float(y_probe[i_best])
         self._best_x = x_probe[i_best]
-        self._range = max(float(np.median(y_probe)) - self._best_y, 1e-5)
         self._n_fe = n_probe
 
         # Warm up the first algorithm (cold) to build a genuine source state.
@@ -174,6 +192,16 @@ class TranslationEnv(gym.Env):
         result = warmup.optimize()
         self._update_best(result)
         self._n_fe = result.get("n_function_evaluations", self._n_fe)
+
+        # Reward scale = remaining distance to the global optimum at the end of
+        # the first optimization period (the warmup). Improvements over the rest
+        # of the episode are measured as a fraction of this initial gap. Falls
+        # back to a probe-spread range on suites that don't expose the optimum.
+        optimum = getattr(self._problem, "optimum", None)
+        if optimum is not None:
+            self._range = max(self._best_y - float(optimum), 1e-12)
+        else:
+            self._range = max(float(np.median(y_probe)) - self._best_y, 1e-5)
 
         self._src_native = _augment(warmup, dim)
         self._src_algo = self.algo_a
@@ -196,23 +224,20 @@ class TranslationEnv(gym.Env):
 
         # Compute the reward BEFORE mutating episode state, so the relative
         # baseline is constructed from the same pre-segment best / FE count.
+        rng = max(self._range, 1e-12)
+        translated_scaled = float(np.clip(translated_improvement / rng, 0.0, 1.0))
         if self.reward_mode == "relative":
             # Counterfactual: run the same target from the *lossy* default hand-off
             # over the same segment (same seed) and reward how much the
-            # translated state beat it. Isolates exactly what the action controls.
+            # translated state beat it (in log-scaled units). Isolates exactly
+            # what the action controls.
             base_improvement = self._baseline_improvement(
                 target, target_fe, seg_seed, prev_best
             )
-            reward = float(
-                np.clip(
-                    (translated_improvement - base_improvement)
-                    / max(self._range, 1e-12),
-                    -1.0,
-                    1.0,
-                )
-            )
+            base_scaled = float(np.clip(base_improvement / rng, 0.0, 1.0))
+            reward = _log_scale(translated_scaled) - _log_scale(base_scaled)
         else:
-            reward = scaled_improvement(prev_best, new_best, self._range)
+            reward = _log_scale(translated_scaled)
 
         # Now advance the episode: the target's resulting state becomes the
         # next source; roles swap.

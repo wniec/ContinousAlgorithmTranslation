@@ -22,7 +22,8 @@ import torch
 import torch.nn.functional as F
 
 from cat.rl.env import TranslationEnv
-from cat.rl.policy import ActorCritic, Step
+from cat.rl.normalize import RunningMeanStd
+from cat.rl.policy import CONTEXT_DIM, ActorCritic, Step
 
 
 @dataclass
@@ -39,6 +40,8 @@ class PPOConfig:
     lambda_cycle: float = 0.05
     lr: float = 3e-4
     max_grad_norm: float = 1.0
+    norm_reward: bool = True
+    norm_obs: bool = True
     device: str = "cpu"
     seed: int = 42
     log_every: int = 1
@@ -56,6 +59,8 @@ class Transition:
 @dataclass
 class PPOLog:
     history: list[dict] = field(default_factory=list)
+    ret_rms: "RunningMeanStd | None" = None
+    obs_rms: "RunningMeanStd | None" = None
 
 
 def _gae(rewards, values, gamma, lam):
@@ -71,35 +76,70 @@ def _gae(rewards, values, gamma, lam):
     return adv, returns
 
 
+def _normalize_rewards(rewards: list[float], gamma: float, ret_rms: RunningMeanStd):
+    """Scale rewards by the running std of the discounted return (PPO standard)."""
+    R = 0.0
+    discounted = []
+    for r in rewards:
+        R = gamma * R + r
+        discounted.append(R)
+    ret_rms.update(np.asarray(discounted)[:, None])
+    std = float(ret_rms.std.item()) + 1e-8
+    return [r / std for r in rewards]
+
+
 def collect_rollout(
-    ac: ActorCritic, envs, cfg: PPOConfig, ep_rng
+    ac: ActorCritic,
+    envs,
+    cfg: PPOConfig,
+    ep_rng,
+    ret_rms: RunningMeanStd | None = None,
+    obs_rms: RunningMeanStd | None = None,
 ) -> tuple[list[Transition], list[float]]:
-    """Run whole episodes until at least rollout_steps transitions are gathered."""
+    """Run whole episodes until at least rollout_steps transitions are gathered.
+
+    Reward normalization (``ret_rms``) and context/observation normalization
+    (``obs_rms``) use running statistics that persist across updates; the
+    normalized context is stored in each transition so the PPO update is
+    consistent with what the policy saw at collection time.
+    """
     transitions: list[Transition] = []
     ep_returns: list[float] = []
     while len(transitions) < cfg.rollout_steps:
         env: TranslationEnv = envs[ep_rng.integers(len(envs))]
         obs, _ = env.reset()
         ep: list[Transition] = []
-        rewards, values = [], []
+        rewards, values, contexts = [], [], []
         done = False
         while not done:
             if not env.source_has_full_state():
                 break  # degenerate source; abandon this episode
-            step = ac.act(obs, device=cfg.device)
+            raw_ctx = np.asarray(obs["context"], dtype=np.float32)
+            if obs_rms is not None:
+                obs_rms.update(raw_ctx[None])
+                ctx = obs_rms.normalize(raw_ctx)
+            else:
+                ctx = raw_ctx
+            step = ac.act(obs, device=cfg.device, context=ctx)
             next_obs, reward, term, trunc, _ = env.step(step.native)
-            ep.append(Transition(step=step, reward=reward, context=obs["context"]))
+            ep.append(Transition(step=step, reward=reward, context=ctx))
             rewards.append(reward)
             values.append(step.value)
+            contexts.append(ctx)
             done = term or trunc
             obs = next_obs
         if not ep:
             continue
-        adv, ret = _gae(rewards, values, cfg.gamma, cfg.gae_lambda)
+        ep_returns.append(float(sum(rewards)))  # report the RAW return
+        train_rewards = (
+            _normalize_rewards(rewards, cfg.gamma, ret_rms)
+            if ret_rms is not None
+            else rewards
+        )
+        adv, ret = _gae(train_rewards, values, cfg.gamma, cfg.gae_lambda)
         for tr, a, r in zip(ep, adv, ret):
             tr.adv, tr.ret = a, r
         transitions.extend(ep)
-        ep_returns.append(float(sum(rewards)))
     return transitions, ep_returns
 
 
@@ -194,14 +234,23 @@ def update(ac: ActorCritic, opt, transitions: list[Transition], cfg: PPOConfig) 
 
 
 def train_ppo(ac: ActorCritic, envs, cfg: PPOConfig, log_fn=None) -> PPOLog:
-    """Run PPO. ``log_fn(metrics)`` is called once per update (for W&B; optional)."""
+    """Run PPO. ``log_fn(metrics)`` is called once per update (for W&B; optional).
+
+    The reward/observation normalizers (running statistics) are attached to the
+    returned log as ``log.ret_rms`` / ``log.obs_rms`` so they can be checkpointed.
+    """
     ac.to(cfg.device)
     opt = torch.optim.Adam(ac.parameters(), lr=cfg.lr)
     ep_rng = np.random.default_rng(cfg.seed)
     log = PPOLog()
+    ret_rms = RunningMeanStd(()) if cfg.norm_reward else None
+    obs_rms = RunningMeanStd((CONTEXT_DIM,)) if cfg.norm_obs else None
+    log.ret_rms, log.obs_rms = ret_rms, obs_rms
 
     for u in range(cfg.updates):
-        transitions, ep_returns = collect_rollout(ac, envs, cfg, ep_rng)
+        transitions, ep_returns = collect_rollout(
+            ac, envs, cfg, ep_rng, ret_rms, obs_rms
+        )
         m = update(ac, opt, transitions, cfg)
         m["update"] = u
         m["mean_return"] = float(np.mean(ep_returns)) if ep_returns else 0.0

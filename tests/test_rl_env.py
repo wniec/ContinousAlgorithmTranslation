@@ -47,7 +47,9 @@ def test_episode_runs_n_switches_steps():
     env = _env(n_switches=4)
     rewards, steps = _run_episode(env)
     assert steps == 4
-    assert all(np.isfinite(r) and 0.0 <= r <= 1.0 for r in rewards)
+    # Absolute reward is log-scaled improvement: non-negative, finite, unbounded
+    # above by 1 (max is log(1 + 1/eps)).
+    assert all(np.isfinite(r) and r >= 0.0 for r in rewards)
 
 
 def test_targets_alternate():
@@ -91,6 +93,31 @@ def test_relative_reward_zero_for_lossy_action():
         obs, r, term, trunc, _ = env.step(_lossy_action(obs))
         assert abs(r) < 1e-9
         done = term or trunc
+
+
+def test_log_scaled_reward_properties():
+    from cat.rl.env import log_scaled_improvement, _log_scale
+
+    # no improvement -> 0; improvement -> positive and monotonic in improvement.
+    assert log_scaled_improvement(5.0, 5.0, 4.0) == 0.0
+    assert log_scaled_improvement(5.0, 6.0, 4.0) == 0.0  # worse -> 0
+    r_small = log_scaled_improvement(5.0, 4.9, 4.0)
+    r_big = log_scaled_improvement(5.0, 1.0, 4.0)
+    assert 0.0 < r_small < r_big
+    # full-range improvement saturates at log(1 + 1/eps).
+    import math
+
+    assert math.isclose(_log_scale(1.0), math.log(1 + 1000.0), rel_tol=1e-6)
+
+
+def test_range_uses_distance_to_optimum():
+    env = _env(seed=11)
+    env.reset()
+    optimum = env._problem.optimum
+    # range = best-so-far after warmup minus the global optimum (>= 0).
+    assert env._range >= 0.0
+    assert abs(env._range - (env._best_y - optimum)) < 1e-6
+    assert env._best_y >= optimum - 1e-9
 
 
 def test_scaled_improvement_bounds():

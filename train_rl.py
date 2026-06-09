@@ -85,8 +85,20 @@ def parse_args():
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--clip", type=float, default=0.2)
     p.add_argument("--ent-coef", type=float, default=0.0)
-    p.add_argument("--vf-coef", type=float, default=0.025)
+    p.add_argument("--vf-coef", type=float, default=0.5)
     p.add_argument("--lambda-cycle", type=float, default=0.05)
+    p.add_argument(
+        "--no-norm-reward",
+        dest="norm_reward",
+        action="store_false",
+        help="disable reward normalization (running std of the discounted return)",
+    )
+    p.add_argument(
+        "--no-norm-obs",
+        dest="norm_obs",
+        action="store_false",
+        help="disable observation (context) normalization",
+    )
     p.add_argument("--lr", type=float, default=3e-5)
     p.add_argument(
         "--device",
@@ -136,6 +148,8 @@ def main():
         vf_coef=args.vf_coef,
         lambda_cycle=args.lambda_cycle,
         lr=args.lr,
+        norm_reward=args.norm_reward,
+        norm_obs=args.norm_obs,
         device=args.device,
         seed=args.seed,
     )
@@ -147,21 +161,24 @@ def main():
         config={**vars(args), "trainer": "ppo"},
         x_axis="update",
     )
-    train_ppo(ac, envs, cfg, log_fn=logger.log)
+    ppo_log = train_ppo(ac, envs, cfg, log_fn=logger.log)
     logger.finish()
 
     out = args.out or os.path.join("models", f"{args.algo_a}_{args.algo_b}_rl.pt")
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     # Save the actor's TranslatorPair under "state_dict" so evaluate.py /
-    # load_translator can consume it directly; keep the full actor-critic too.
-    torch.save(
-        {
-            "state_dict": ac.translator.state_dict(),
-            "actor_critic_state_dict": ac.state_dict(),
-            **translator_meta(ac.translator),
-        },
-        out,
-    )
+    # load_translator can consume it directly; keep the full actor-critic and the
+    # running normalizer statistics too (for resuming / reproducibility).
+    ckpt = {
+        "state_dict": ac.translator.state_dict(),
+        "actor_critic_state_dict": ac.state_dict(),
+        **translator_meta(ac.translator),
+    }
+    if ppo_log.ret_rms is not None:
+        ckpt["ret_rms"] = ppo_log.ret_rms.state_dict()
+    if ppo_log.obs_rms is not None:
+        ckpt["obs_rms"] = ppo_log.obs_rms.state_dict()
+    torch.save(ckpt, out)
     print(f"saved RL translator to {out}")
 
 
