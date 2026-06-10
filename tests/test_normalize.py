@@ -38,6 +38,7 @@ def _envs():
             fe_multiplier=200,
             n_switches=3,
             n_individuals=12,
+            use_ela=False,
             seed=0,
         )
     ]

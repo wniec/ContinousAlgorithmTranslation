@@ -114,7 +114,13 @@ def collect_rollout(
         while not done:
             if not env.source_has_full_state():
                 break  # degenerate source; abandon this episode
-            raw_ctx = np.asarray(obs["context"], dtype=np.float32)
+            # Critic side-input: progress scalars concatenated with ELA features.
+            raw_ctx = np.concatenate(
+                [
+                    np.asarray(obs["context"], dtype=np.float32),
+                    np.asarray(obs["ela"], dtype=np.float32),
+                ]
+            )
             if obs_rms is not None:
                 obs_rms.update(raw_ctx[None])
                 ctx = obs_rms.normalize(raw_ctx)

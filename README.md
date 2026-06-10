@@ -20,6 +20,15 @@ state splits into:
 - **specific** fields — the algorithm's own machinery, which a bidirectional
   translator learns to map between algorithms.
 
+Three optimizers are implemented (`cat/optimizers/`): **PSO** (per-particle
+velocities + personal bests), **CMA-ES** (mean + covariance + step-size +
+evolution paths), and **MadDE** (Biswas et al., CEC 2021 — a self-adaptive DE
+whose translated field is its **external archive**, a variable-size *point-set*).
+The archive is a distinct `POINT_SET` field type: the encoder pools it
+(set-equivariant), and the decoder regenerates it as `round(2.3·N)` points
+seeded from the carried population. Any pair can be translated
+(`PSO`/`CMAES`/`MADDE`).
+
 A `TranslatorPair` holds an encoder + decoder head per algorithm. Translating
 `A -> B` reuses A's population and only decodes B's specific fields. It is trained
 with three objectives (`cat/losses.py`):
@@ -112,7 +121,14 @@ python train_rl.py PSO CMAES -d 2 3 5 --n-individuals 12 \
 - **Action**: a Gaussian policy over the decoded target fields (covariance
   sampled in factor space → stays PSD).
 - **Critic**: its own encoder (decoupled from the actor) with PPO value-clipping
-  and a Huber loss, so a value-function spike can't swamp the policy gradient.
+  and a Huber loss, so a value-function spike can't swamp the policy gradient. It
+  additionally consumes a side-input of **22 ELA landscape features** (pflacco;
+  `cat/suite/ela.py`) computed from the episode's accumulated evaluations, plus
+  the 2 progress scalars — both running-normalized. ELA feeds **only the critic**
+  (the actor/translator stays a function of the optimizer state alone, so
+  `evaluate.py` and the supervised path are unaffected). Disable with `--no-ela`.
+  Note: pflacco's information-content features JIT-compile (numba) on first call
+  (~one-time warmup) and add per-step cost.
 - **Normalization** (on by default): rewards are scaled by the running std of the
   discounted return, and the scalar context observation is standardized by its
   running mean/std — both persisted across updates so value targets and

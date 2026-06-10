@@ -95,4 +95,4 @@ class NormContext:
 
 # Position-like canonical fields (centre + scale); everything else is a
 # displacement (scale only), a matrix, or a scalar.
-POSITION_LIKE = {"positions", "best_x", "pbest_x", "nbest_x", "mean"}
+POSITION_LIKE = {"positions", "best_x", "pbest_x", "nbest_x", "mean", "archive"}

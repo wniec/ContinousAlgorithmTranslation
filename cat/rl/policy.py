@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 from torch import Tensor, nn
 from torch.distributions import Normal
@@ -26,8 +27,13 @@ from cat.models.layers import MLP
 from cat.models.norm import NormContext
 from cat.models.translator import TranslatorPair
 from cat.state.canonical import CanonicalState, from_canonical, to_canonical
+from cat.suite.ela import ELA_DIM
 
-CONTEXT_DIM = 2
+PROGRESS_DIM = 2
+# The critic's side-input: progress scalars + ELA landscape features. (Only the
+# critic sees these; the actor/translator stays a function of the optimizer
+# state alone, so evaluate.py / the supervised path are unaffected by ELA.)
+CONTEXT_DIM = PROGRESS_DIM + ELA_DIM
 
 
 @dataclass
@@ -92,9 +98,12 @@ class ActorCritic(nn.Module):
         target = obs["target_algo"]
         batch = collate([src])
         ctx = _ctx(batch)
-        # `context` overrides obs["context"] with the (running-)normalized vector.
-        ctx_vec = obs["context"] if context is None else context
-        context = torch.as_tensor(ctx_vec, dtype=torch.float32, device=device)
+        # The critic side-input is [progress, ELA]. `context` (when given by the
+        # PPO loop) is the running-normalized version; otherwise build it raw.
+        if context is None:
+            ela = obs.get("ela", np.zeros(ELA_DIM, dtype=np.float32))
+            context = np.concatenate([obs["context"], ela])
+        context = torch.as_tensor(context, dtype=torch.float32, device=device)
 
         z = self.translator.encode(batch, ctx)
         mean = self.translator.decoders[target].action_mean(z, batch.positions, ctx)

@@ -7,6 +7,7 @@ Add new algorithm classes here and they become selectable by name in train.py
 
 from cat.optimizers.PSO import SPSO, SPSOL, IPSO, CPSO
 from cat.optimizers.ES import CMAES
+from cat.optimizers.DE import MADDE
 
 PORTFOLIO: dict = {
     "SPSO": SPSO,
@@ -15,6 +16,7 @@ PORTFOLIO: dict = {
     "CPSO": CPSO,
     "PSO": SPSO,  # convenient alias: the standard global-best PSO
     "CMAES": CMAES,
+    "MADDE": MADDE,
 }
 
 

@@ -21,6 +21,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from cat.optimizers.DE import ARATE
 from cat.state.schema import Struct, get_spec
 
 
@@ -110,16 +111,17 @@ def to_canonical(algo: str, native: dict, device="cpu") -> CanonicalState:
     best_x = _as_tensor(_get("best_x"), device).reshape(-1)
     best_y = _as_tensor(_get("best_y"), device).reshape(())
 
+    D = positions.shape[-1]
     specific: dict[str, Tensor] = {}
     for f in spec.specific:
         raw = _get(f.native_key)
         t = _as_tensor(raw, device)
         if f.struct is Struct.SCALAR:
             t = t.reshape(())
-        elif f.struct is Struct.PER_PARTICLE:
+        elif f.struct in (Struct.PER_PARTICLE, Struct.PER_DIM):
             t = t.reshape(-1)
-        elif f.struct is Struct.PER_DIM:
-            t = t.reshape(-1)
+        elif f.struct is Struct.POINT_SET:
+            t = t.reshape(-1, D)
         specific[f.name] = t
 
     # CMA-ES: fold step-size into the covariance -> full search covariance Sigma.
@@ -129,7 +131,28 @@ def to_canonical(algo: str, native: dict, device="cpu") -> CanonicalState:
             raise ValueError("CMAES: missing native field 'sigma'")
         specific["sigma_cov"] = specific["sigma_cov"] * float(sigma) ** 2
 
+    # MadDE: resize the archive to its fixed capacity round(ARATE * N) so the
+    # point-set has a constant size within each (algo, D, N) batch group.
+    if algo == "MADDE":
+        m_cap = max(1, int(round(ARATE * positions.shape[0])))
+        specific["archive"] = _resize_point_set(specific["archive"], m_cap, positions)
+
     return CanonicalState(algo, positions, values, best_x, best_y, specific)
+
+
+def _resize_point_set(points: Tensor, m_cap: int, positions: Tensor) -> Tensor:
+    """Resize a point-set to exactly ``m_cap`` rows, deterministically: truncate
+    if too many; if too few, cycle the existing points (or the population, when
+    the set is empty). Deterministic so the canonical state — and hence the
+    cycle-consistency loss — is well-defined."""
+    m = points.shape[0]
+    if m == m_cap:
+        return points
+    if m > m_cap:
+        return points[:m_cap]
+    src = points if m > 0 else positions
+    idx = torch.arange(m_cap, device=points.device) % src.shape[0]
+    return src[idx]
 
 
 # --------------------------------------------------------------------------- #
