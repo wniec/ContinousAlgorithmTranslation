@@ -47,6 +47,13 @@ class StateEncoder(nn.Module):
         self.pd_fields = [f for f in spec.specific if f.struct is Struct.PER_DIM]
         self.has_cov = any(f.struct is Struct.MATRIX for f in spec.specific)
         self.scalar_fields = [f for f in spec.specific if f.struct is Struct.SCALAR]
+        self.set_fields = [f for f in spec.specific if f.struct is Struct.POINT_SET]
+
+        # Optional point-set (e.g. DE archive) stream: per-(point, dim) MLP ->
+        # DeepSets pool over the set -> per-dim features added to the dim-tokens.
+        if self.set_fields:
+            self.set_cell_mlp = MLP([1, hidden, hidden], last_act=True)
+            self.set_proj = nn.Linear(2 * hidden, hidden)
 
         # per-cell input channels: positions + PPD specific (ppd) ;
         # values (pp, broadcast) ; best_x + PD specific (pd, broadcast)
@@ -93,6 +100,12 @@ class StateEncoder(nn.Module):
 
         tokens = self.pool_proj(self.pool(cells))  # (B, D, H)
 
+        # Point-set (archive) contribution to the dimension-tokens.
+        for f in self.set_fields:
+            pts_n = ctx.normalize(state.specific[f.name], Struct.POINT_SET, True)
+            acells = self.set_cell_mlp(pts_n.unsqueeze(-1))  # (B, M, D, H)
+            tokens = tokens + self.set_proj(self.pool(acells))  # (B, D, H)
+
         cov_bias = self._cov_bias(state, ctx, pos_n)
         for layer in self.attn:
             tokens = layer(tokens, cov_bias)
@@ -110,7 +123,11 @@ class StateEncoder(nn.Module):
         cov_emp = xc.transpose(1, 2) @ xc / max(pos_n.shape[1], 1)
         if self.has_cov:
             cov_n = ctx.normalize(state.specific["sigma_cov"], Struct.MATRIX, False)
-            return cov_emp + cov_n
+            cov_emp = cov_emp + cov_n
+        for f in self.set_fields:  # add the archive's empirical covariance
+            pts_n = ctx.normalize(state.specific[f.name], Struct.POINT_SET, True)
+            ac = pts_n - pts_n.mean(dim=1, keepdim=True)
+            cov_emp = cov_emp + ac.transpose(1, 2) @ ac / max(pts_n.shape[1], 1)
         return cov_emp
 
     def _global_scalars(self, state, ctx, N: int, D: int) -> Tensor:

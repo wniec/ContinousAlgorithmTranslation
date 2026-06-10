@@ -18,6 +18,7 @@ def _env(seed=0, n_switches=4):
         fe_multiplier=200,
         n_switches=n_switches,
         n_individuals=12,
+        use_ela=False,  # keep mechanics tests fast; ELA covered in test_ela.py
         seed=seed,
     )
 
@@ -83,6 +84,7 @@ def test_relative_reward_zero_for_lossy_action():
         n_switches=4,
         n_individuals=12,
         reward_mode="relative",
+        use_ela=False,
         seed=5,
     )
     obs, _ = env.reset()
@@ -104,6 +106,7 @@ def test_noswitch_reward_bounds_and_sign():
         n_switches=4,
         n_individuals=12,
         reward_mode="noswitch",
+        use_ela=False,
         seed=5,
     )
     obs, _ = env.reset()

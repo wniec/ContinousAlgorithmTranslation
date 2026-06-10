@@ -27,6 +27,7 @@ from torch import Tensor, nn
 from cat.models.encoder import Latent
 from cat.models.layers import MLP, CovFactorHead
 from cat.models.norm import POSITION_LIKE, NormContext
+from cat.optimizers.DE import ARATE
 from cat.state.schema import Struct, get_spec
 
 
@@ -44,6 +45,7 @@ class StateDecoder(nn.Module):
         ]
         self.pd_fields = [f for f in spec.specific if f.struct is Struct.PER_DIM]
         self.scalar_fields = [f for f in spec.specific if f.struct is Struct.SCALAR]
+        self.set_fields = [f for f in spec.specific if f.struct is Struct.POINT_SET]
         self.cov_field = next(
             (f for f in spec.specific if f.struct is Struct.MATRIX), None
         )
@@ -53,6 +55,9 @@ class StateDecoder(nn.Module):
         if self.ppd_fields:
             # input: dim-token (H) + normalized position scalar (1)
             self.ppd_head = MLP([hidden + 1, hidden, len(self.ppd_fields)])
+        if self.set_fields:
+            # input: dim-token (H) + the slot's seed-position coord (1)
+            self.set_head = MLP([hidden + 1, hidden, len(self.set_fields)])
         if self.scalar_fields:
             self.scalar_head = nn.Linear(hidden, len(self.scalar_fields))
         if self.cov_field is not None:
@@ -60,10 +65,14 @@ class StateDecoder(nn.Module):
 
         self._small_init()
 
+    @staticmethod
+    def _m_cap(n: int) -> int:
+        return max(1, int(round(ARATE * n)))
+
     def _small_init(self):
         """Start near zero so initial decoded fields (in normalized space) are
         small — keeps the first training steps stable."""
-        for head in ("pd_head", "ppd_head", "scalar_head"):
+        for head in ("pd_head", "ppd_head", "set_head", "scalar_head"):
             mod = getattr(self, head, None)
             if mod is None:
                 continue
@@ -82,6 +91,8 @@ class StateDecoder(nn.Module):
             segs.append(("pd", (D, len(self.pd_fields))))
         if self.ppd_fields:
             segs.append(("ppd", (N, D, len(self.ppd_fields))))
+        if self.set_fields:
+            segs.append(("set", (self._m_cap(N), D, len(self.set_fields))))
         if self.cov_field is not None:
             segs.append(("cov_L", (D, self.cov_rank)))
             segs.append(("cov_d", (D,)))
@@ -114,6 +125,15 @@ class StateDecoder(nn.Module):
             cell_in = torch.cat([tok, pos_n.unsqueeze(-1)], dim=-1)
             parts.append(self.ppd_head(cell_in).reshape(B, -1))  # (B, N*D*n_ppd)
 
+        if self.set_fields:
+            N = positions.shape[1]
+            M = self._m_cap(N)
+            seed = self._seed_positions(positions, M)  # (B, M, D)
+            seed_n = ctx.normalize(seed, Struct.POINT_SET, True)
+            tok = z.dim_tokens.unsqueeze(1).expand(B, M, D, self.hidden)
+            cell_in = torch.cat([tok, seed_n.unsqueeze(-1)], dim=-1)
+            parts.append(self.set_head(cell_in).reshape(B, -1))  # (B, M*D*n_set)
+
         if self.cov_field is not None:
             L, d_raw = self.cov_head.factor(tokens)
             parts.append(L.reshape(B, -1))  # (B, D*rank)
@@ -123,6 +143,15 @@ class StateDecoder(nn.Module):
             parts.append(self.scalar_head(z.global_vec))  # (B, n_scalar)
 
         return torch.cat(parts, dim=-1)
+
+    @staticmethod
+    def _seed_positions(positions: Tensor, m: int) -> Tensor:
+        """Seed ``m`` point-set slots deterministically by cycling the population
+        (slot i <- population[i mod N]); keeps archive decode reproducible so the
+        cycle-consistency loss is well-defined."""
+        n = positions.shape[1]
+        idx = torch.arange(m, device=positions.device) % n
+        return positions[:, idx, :]
 
     def build_state(
         self, coords: Tensor, ctx: NormContext, n: int
@@ -156,6 +185,11 @@ class StateDecoder(nn.Module):
             elif name == "cov_d":
                 cov_n = self.cov_head.assemble(cov_L, chunk)
                 out[self.cov_field.name] = ctx.denormalize(cov_n, Struct.MATRIX, False)
+            elif name == "set":
+                for i, f in enumerate(self.set_fields):
+                    out[f.name] = ctx.denormalize(
+                        chunk[..., i], Struct.POINT_SET, f.name in POSITION_LIKE
+                    )
             elif name == "scalar":
                 for i, f in enumerate(self.scalar_fields):
                     out[f.name] = ctx.denormalize(chunk[:, i], Struct.SCALAR, False)

@@ -32,6 +32,9 @@ class Struct(Enum):
     PER_DIM = "pd"  # (D,)   e.g. distribution mean, evolution paths
     MATRIX = "mat"  # (D, D) e.g. covariance matrix
     SCALAR = "scalar"  # ()     e.g. step-size sigma
+    POINT_SET = "set"  # (M, D) a variable-size set of points, M independent of N
+    #                          (e.g. a DE external archive). M is fixed per (D, N)
+    #                          group (capacity = round(ARATE * N)).
 
 
 class Constraint(Enum):
@@ -108,12 +111,24 @@ CMAES_SPEC = StateSpec(
 )
 
 
+# MadDE's translated state is its external archive — a variable-size *set* of
+# inferior solutions used in mutation (the structurally novel field vs. PSO
+# velocities / CMA-ES covariance). The SHADE F/Cr memory and mutation-strategy
+# probabilities are internal adaptation that re-initializes on a switch, so they
+# are not translated; the population is the shared field.
+MADDE_SPEC = StateSpec(
+    algo="MADDE",
+    specific=(Field("archive", Struct.POINT_SET, "archive", weight=1.0),),
+)
+
+
 _SPECS: dict[str, StateSpec] = {
     "PSO": PSO_SPEC,
     "SPSO": PSO_SPEC,
     "SPSOL": PSO_SPEC,
     "CPSO": PSO_SPEC,
     "CMAES": CMAES_SPEC,
+    "MADDE": MADDE_SPEC,
 }
 
 

@@ -47,6 +47,7 @@ def build_envs(args) -> list[TranslationEnv]:
                 n_switches=args.n_switches,
                 n_individuals=args.n_individuals,
                 reward_mode=args.reward_mode,
+                use_ela=args.use_ela,
                 seed=args.seed * 100 + dim,
             )
         )
@@ -65,6 +66,12 @@ def parse_args():
     p.add_argument("--n-switches", type=int, default=6)
     p.add_argument("--n-individuals", type=int, default=12)
     p.add_argument(
+        "--no-ela",
+        dest="use_ela",
+        action="store_false",
+        help="disable ELA landscape features in the critic observation (faster)",
+    )
+    p.add_argument(
         "--reward-mode",
         choices=["noswitch", "absolute", "relative"],
         default="noswitch",
@@ -77,18 +84,18 @@ def parse_args():
     p.add_argument("--hidden", type=int, default=64)
     p.add_argument("--n-layers", type=int, default=2)
     p.add_argument("--cov-rank", type=int, default=4)
-    p.add_argument("--log-std-init", type=float, default=-1.0)
+    p.add_argument("--log-std-init", type=float, default=1.0)
     # PPO
     p.add_argument("--updates", type=int, default=100)
-    p.add_argument("--rollout-steps", type=int, default=1024)
+    p.add_argument("--rollout-steps", type=int, default=2048)
     p.add_argument("--ppo-epochs", type=int, default=4)
-    p.add_argument("--minibatch-size", type=int, default=64)
+    p.add_argument("--minibatch-size", type=int, default=256)
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--clip", type=float, default=0.2)
     p.add_argument("--ent-coef", type=float, default=0.0)
-    p.add_argument("--vf-coef", type=float, default=0.5)
-    p.add_argument("--lambda-cycle", type=float, default=0.05)
+    p.add_argument("--vf-coef", type=float, default=0.05)
+    p.add_argument("--lambda-cycle", type=float, default=5.0)
     p.add_argument(
         "--no-norm-reward",
         dest="norm_reward",
