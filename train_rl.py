@@ -86,7 +86,7 @@ def parse_args():
     p.add_argument("--cov-rank", type=int, default=4)
     p.add_argument("--log-std-init", type=float, default=1.0)
     # PPO
-    p.add_argument("--updates", type=int, default=100)
+    p.add_argument("--updates", type=int, default=500)
     p.add_argument("--rollout-steps", type=int, default=2048)
     p.add_argument("--ppo-epochs", type=int, default=4)
     p.add_argument("--minibatch-size", type=int, default=256)
