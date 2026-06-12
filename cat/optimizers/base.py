@@ -136,6 +136,7 @@ def sample_switch_points(
     n_individuals: int,
     rng: np.random.Generator,
     fe_min: int | None = None,
+    cdb: float = 1.0,
 ) -> np.ndarray:
     """Sample ``n_switches`` cumulative FE targets with log-uniform positioning.
 
@@ -146,18 +147,32 @@ def sample_switch_points(
     call (i.e. independently per problem). The interior points are sorted; the
     final target is always ``max_fe`` so the full budget is used.
 
+    ``cdb`` reshapes *where in log-FE space* the points land via a base-``cdb``
+    warp ``w(u) = (cdb**u - 1) / (cdb - 1)`` of a uniform ``u in [0, 1]`` (note a
+    plain change of logarithm base is a no-op, since uniform-in-log is identical
+    for every base — this warp is what actually moves mass):
+
+    * ``cdb == 1.0`` -> ``w(u) = u`` -> the plain log-uniform distribution above.
+    * ``cdb > 1.0``  -> mass pushed toward small log-FE -> even more switches early.
+    * ``0 < cdb < 1`` -> mass pushed toward large log-FE -> more switches late.
+
     Returns a strictly increasing int array of length ``n_switches`` whose last
     entry is ``max_fe`` and whose consecutive gaps are at least
     ``n_individuals`` (so every segment can evaluate at least one population).
     """
+    if cdb <= 0.0:
+        raise ValueError(f"cdb must be positive, got {cdb}")
     step = max(int(n_individuals), 1)
     fe_min = int(fe_min) if fe_min is not None else step
     fe_min = max(2, min(fe_min, max_fe))
     if n_switches <= 1:
         return np.array([max_fe], dtype=int)
 
-    log_pts = rng.uniform(np.log(fe_min), np.log(max_fe), size=n_switches - 1)
-    interior = np.exp(np.sort(log_pts))
+    log_lo, log_hi = np.log(fe_min), np.log(max_fe)
+    u = rng.uniform(0.0, 1.0, size=n_switches - 1)
+    # Base-cdb warp of the uniform draw, monotone in u (so sorting w == sorting u).
+    w = u if abs(cdb - 1.0) < 1e-12 else (np.power(cdb, u) - 1.0) / (cdb - 1.0)
+    interior = np.exp(log_lo + np.sort(w) * (log_hi - log_lo))
     # Leave room for the remaining segments + the final max_fe target.
     interior = np.clip(interior, fe_min, max_fe - step)
     points = np.concatenate([interior, [max_fe]]).astype(int)

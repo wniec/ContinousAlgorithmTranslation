@@ -14,7 +14,7 @@ Standard clipped-surrogate PPO with GAE, specialized in two ways:
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -40,6 +40,13 @@ class PPOConfig:
     lambda_cycle: float = 0.05
     lr: float = 3e-4
     max_grad_norm: float = 1.0
+    # Sliding-window rollout buffer: each update collects ~rollout_steps fresh
+    # transitions, appends them to a deque of this capacity, and trains on the
+    # whole window — so each record is reused across roughly
+    # ``buffer_capacity / rollout_steps`` updates. ``None`` keeps only the latest
+    # rollout (textbook on-policy PPO). Clamped up to rollout_steps so a full
+    # fresh rollout always fits.
+    buffer_capacity: int | None = None
     norm_reward: bool = True
     norm_obs: bool = True
     device: str = "cpu"
@@ -61,6 +68,34 @@ class PPOLog:
     history: list[dict] = field(default_factory=list)
     ret_rms: "RunningMeanStd | None" = None
     obs_rms: "RunningMeanStd | None" = None
+
+
+class RolloutBuffer:
+    """Sliding-window store of transitions, retained across PPO updates.
+
+    Mirrors ``DynamicAlgorithmSelection``'s ``RolloutBuffer``: rather than a
+    fresh buffer per update (textbook on-policy PPO), it keeps the most recent
+    ``capacity`` transitions so each record is reused over several updates. The
+    clipped PPO ratio (``exp(logp - old_logp)``) tolerates the mild
+    off-policyness of older records still inside the window.
+    """
+
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self._buf: "deque[Transition]" = deque(maxlen=capacity)
+
+    def clear(self) -> None:
+        self._buf.clear()
+
+    def extend(self, transitions: list[Transition]) -> None:
+        # deque(maxlen) evicts the oldest transitions once capacity is exceeded.
+        self._buf.extend(transitions)
+
+    def as_list(self) -> list[Transition]:
+        return list(self._buf)
+
+    def __len__(self) -> int:
+        return len(self._buf)
 
 
 def _gae(rewards, values, gamma, lam):
@@ -156,10 +191,11 @@ def _group_key(tr: Transition):
 
 def update(ac: ActorCritic, opt, transitions: list[Transition], cfg: PPOConfig) -> dict:
     device = torch.device(cfg.device)
+    # Normalize advantages into a local array indexed by position — never mutate
+    # Transition.adv, since records persist across updates (sliding-window
+    # buffer) and the stored raw GAE must survive for the next update.
     advs = torch.tensor([t.adv for t in transitions], dtype=torch.float32)
-    advs = (advs - advs.mean()) / (advs.std() + 1e-8)
-    for t, a in zip(transitions, advs.tolist()):
-        t.adv = a
+    norm_advs = ((advs - advs.mean()) / (advs.std() + 1e-8)).tolist()
 
     groups: dict[tuple, list[int]] = defaultdict(list)
     for i, tr in enumerate(transitions):
@@ -196,7 +232,7 @@ def update(ac: ActorCritic, opt, transitions: list[Transition], cfg: PPOConfig) 
                     device=device,
                 )
                 adv = torch.tensor(
-                    [transitions[i].adv for i in mb], dtype=torch.float32, device=device
+                    [norm_advs[i] for i in mb], dtype=torch.float32, device=device
                 )
                 ret = torch.tensor(
                     [transitions[i].ret for i in mb], dtype=torch.float32, device=device
@@ -256,14 +292,21 @@ def train_ppo(ac: ActorCritic, envs, cfg: PPOConfig, log_fn=None) -> PPOLog:
     obs_rms = RunningMeanStd((CONTEXT_DIM,)) if cfg.norm_obs else None
     log.ret_rms, log.obs_rms = ret_rms, obs_rms
 
+    # Persistent sliding-window buffer: each record lives for several updates.
+    # Clamp capacity up so at least one full fresh rollout always fits.
+    capacity = max(cfg.buffer_capacity or cfg.rollout_steps, cfg.rollout_steps)
+    buffer = RolloutBuffer(capacity)
+
     for u in range(cfg.updates):
-        transitions, ep_returns = collect_rollout(
-            ac, envs, cfg, ep_rng, ret_rms, obs_rms
-        )
-        m = update(ac, opt, transitions, cfg)
+        fresh, ep_returns = collect_rollout(ac, envs, cfg, ep_rng, ret_rms, obs_rms)
+        buffer.extend(fresh)
+        m = update(ac, opt, buffer.as_list(), cfg)
         m["update"] = u
+        # Report the raw return of the freshly collected episodes only, so the
+        # learning curve reflects the current policy (not stale window records).
         m["mean_return"] = float(np.mean(ep_returns)) if ep_returns else 0.0
-        m["n_transitions"] = len(transitions)
+        m["n_transitions"] = len(buffer)
+        m["n_fresh"] = len(fresh)
         log.history.append(m)
         if log_fn is not None:
             log_fn(m)

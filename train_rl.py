@@ -47,6 +47,7 @@ def build_envs(args) -> list[TranslationEnv]:
                 n_switches=args.n_switches,
                 n_individuals=args.n_individuals,
                 reward_mode=args.reward_mode,
+                switch_cdb=args.switch_cdb,
                 use_ela=args.use_ela,
                 seed=args.seed * 100 + dim,
             )
@@ -65,6 +66,13 @@ def parse_args():
     p.add_argument("--fe-multiplier", type=int, default=2000)
     p.add_argument("--n-switches", type=int, default=6)
     p.add_argument("--n-individuals", type=int, default=12)
+    p.add_argument(
+        "--switch-cdb",
+        type=float,
+        default=1.0,
+        help="base of the switch-point log-FE warp: 1.0 (default) = plain "
+        "log-uniform; >1 concentrates switches earlier; 0<cdb<1 later.",
+    )
     p.add_argument(
         "--no-ela",
         dest="use_ela",
@@ -87,15 +95,23 @@ def parse_args():
     p.add_argument("--log-std-init", type=float, default=1.0)
     # PPO
     p.add_argument("--updates", type=int, default=500)
-    p.add_argument("--rollout-steps", type=int, default=2048)
+    p.add_argument("--rollout-steps", type=int, default=1024)
+    p.add_argument(
+        "--buffer-capacity",
+        type=int,
+        default=2048,
+        help="sliding-window rollout-buffer size; transitions are reused across "
+        "~buffer_capacity/rollout_steps updates (default 8192 ≈ 4 updates). Set "
+        "equal to --rollout-steps for textbook single-use on-policy PPO.",
+    )
     p.add_argument("--ppo-epochs", type=int, default=4)
     p.add_argument("--minibatch-size", type=int, default=256)
-    p.add_argument("--gamma", type=float, default=0.99)
-    p.add_argument("--gae-lambda", type=float, default=0.95)
+    p.add_argument("--gamma", type=float, default=0.8)
+    p.add_argument("--gae-lambda", type=float, default=0.5)
     p.add_argument("--clip", type=float, default=0.2)
     p.add_argument("--ent-coef", type=float, default=0.0)
     p.add_argument("--vf-coef", type=float, default=0.05)
-    p.add_argument("--lambda-cycle", type=float, default=5.0)
+    p.add_argument("--lambda-cycle", type=float, default=0.1)
     p.add_argument(
         "--no-norm-reward",
         dest="norm_reward",
@@ -148,6 +164,7 @@ def main():
     cfg = PPOConfig(
         updates=args.updates,
         rollout_steps=args.rollout_steps,
+        buffer_capacity=args.buffer_capacity,
         ppo_epochs=args.ppo_epochs,
         minibatch_size=args.minibatch_size,
         gamma=args.gamma,

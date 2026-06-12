@@ -81,6 +81,7 @@ class TranslationEnv(gym.Env):
         n_switches: int = 6,
         n_individuals: int | None = 12,
         reward_mode: str = "noswitch",
+        switch_cdb: float = 1.0,
         use_ela: bool = True,
         seed: int = 0,
     ):
@@ -98,6 +99,7 @@ class TranslationEnv(gym.Env):
         self.n_switches = n_switches
         self.n_individuals = n_individuals
         self.reward_mode = reward_mode
+        self.switch_cdb = switch_cdb
         self._seed = seed
         self.dim = self._parse_dim(problem_ids[0])
 
@@ -207,7 +209,12 @@ class TranslationEnv(gym.Env):
         fe_min = min(n_probe + 2 * pop, max(self._max_fe - pop, n_probe + pop))
         # n_switches + 1 boundaries: [warmup_end, seg_1_end, ..., seg_n_end].
         self._checkpoints = sample_switch_points(
-            self.n_switches + 1, self._max_fe, pop, sw_rng, fe_min=fe_min
+            self.n_switches + 1,
+            self._max_fe,
+            pop,
+            sw_rng,
+            fe_min=fe_min,
+            cdb=self.switch_cdb,
         )
 
         lb, ub = self._problem.lower_bounds, self._problem.upper_bounds

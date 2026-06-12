@@ -7,7 +7,7 @@ import numpy as np
 
 from cat.rl.env import TranslationEnv
 from cat.rl.policy import ActorCritic
-from cat.rl.ppo import PPOConfig, train_ppo
+from cat.rl.ppo import PPOConfig, RolloutBuffer, Transition, train_ppo
 from cat.suite import IOHSuite, build_problem_ids
 
 
@@ -56,6 +56,37 @@ def test_sampled_covariance_action_is_psd():
     eig = np.linalg.eigvalsh(0.5 * (cm + cm.T))
     assert eig.min() > -1e-6
     assert step.native["sigma"] > 0
+
+
+def test_rollout_buffer_window_evicts_oldest():
+    """The buffer keeps only the most recent ``capacity`` transitions (FIFO)."""
+    buf = RolloutBuffer(capacity=3)
+    trs = [Transition(step=None, reward=float(i), context=None) for i in range(5)]
+    buf.extend(trs[:2])
+    assert len(buf) == 2
+    buf.extend(trs[2:])  # total 5 added, capacity 3 -> oldest two evicted
+    assert len(buf) == 3
+    assert [t.reward for t in buf.as_list()] == [2.0, 3.0, 4.0]
+
+
+def test_records_reused_across_updates():
+    """With capacity > rollout_steps the buffer grows past a single rollout, so
+    records survive into later updates (window spans multiple collections)."""
+    ac = ActorCritic("PSO", "CMAES", hidden=32, n_layers=1)
+    cfg = PPOConfig(
+        updates=3,
+        rollout_steps=48,
+        buffer_capacity=512,  # >> rollout_steps -> multi-update reuse
+        ppo_epochs=1,
+        minibatch_size=16,
+        seed=3,
+        log_every=0,
+    )
+    log = train_ppo(ac, _envs(), cfg)
+    # Window accumulates: update 1 holds more than its own fresh batch.
+    assert log.history[0]["n_transitions"] == log.history[0]["n_fresh"]
+    assert log.history[1]["n_transitions"] > log.history[1]["n_fresh"]
+    assert log.history[-1]["n_transitions"] <= cfg.buffer_capacity
 
 
 def test_parameters_change_after_update():
