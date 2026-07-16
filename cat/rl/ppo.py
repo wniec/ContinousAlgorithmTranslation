@@ -9,7 +9,9 @@ Standard clipped-surrogate PPO with GAE, specialized in two ways:
 * the actor objective adds a differentiable **cycle-consistency penalty**
   (``lambda_cycle · A->B->A drift``), realizing the "improvement + cycle penalty"
   objective more sample-efficiently than routing a differentiable quantity
-  through the scalar reward.
+  through the scalar reward. The drift is scored via ``cycle_mode`` — "field"
+  (decoded fields, default) or "latent" (re-encoded latents only), mirroring
+  ``cat.losses.batch_losses`` — and skipped entirely when ``lambda_cycle == 0``.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ class PPOConfig:
     ent_coef: float = 0.0
     vf_coef: float = 0.25
     lambda_cycle: float = 0.05
+    cycle_mode: str = "field"  # "field" (decoded fields) or "latent" (re-encoded latents)
     lr: float = 3e-4
     max_grad_norm: float = 1.0
     # Sliding-window rollout buffer: each update collects ~rollout_steps fresh
@@ -149,13 +152,8 @@ def collect_rollout(
         while not done:
             if not env.source_has_full_state():
                 break  # degenerate source; abandon this episode
-            # Critic side-input: progress scalars concatenated with ELA features.
-            raw_ctx = np.concatenate(
-                [
-                    np.asarray(obs["context"], dtype=np.float32),
-                    np.asarray(obs["ela"], dtype=np.float32),
-                ]
-            )
+            # Critic side-input: progress scalars.
+            raw_ctx = np.asarray(obs["context"], dtype=np.float32)
             if obs_rms is not None:
                 obs_rms.update(raw_ctx[None])
                 ctx = obs_rms.normalize(raw_ctx)
@@ -203,6 +201,7 @@ def update(ac: ActorCritic, opt, transitions: list[Transition], cfg: PPOConfig) 
 
     gen = torch.Generator().manual_seed(cfg.seed)
     metrics = defaultdict(float)
+    policy_stds: list[float] = []
     n_batches = 0
 
     for _ in range(cfg.ppo_epochs):
@@ -252,7 +251,12 @@ def update(ac: ActorCritic, opt, transitions: list[Transition], cfg: PPOConfig) 
                 vl_clipped = F.smooth_l1_loss(v_clipped, ret, reduction="none")
                 value_loss = torch.max(vl_unclipped, vl_clipped).mean()
                 ent = entropy.mean()
-                cycle = ac.cycle_drift(batch, ctx)
+                # Skip the A->B->A round trip entirely when it wouldn't affect
+                # the loss anyway, rather than computing it just to multiply by 0.
+                if cfg.lambda_cycle == 0.0:
+                    cycle = value.new_zeros(())
+                else:
+                    cycle = ac.cycle_drift(batch, ctx, cycle_mode=cfg.cycle_mode)
 
                 loss = (
                     policy_loss
@@ -267,15 +271,26 @@ def update(ac: ActorCritic, opt, transitions: list[Transition], cfg: PPOConfig) 
 
                 metrics["policy_loss"] += float(policy_loss.detach())
                 metrics["value_loss"] += float(value_loss.detach())
+                metrics["cycle"] += float(cycle.detach())
                 # Log the exploration scale (policy std) rather than the summed
                 # differential entropy: std is sign-stable and independent of the
                 # action dimension, which varies across (PSO/CMA-ES)-target groups.
-                metrics["policy_std"] += float(ac.log_std.exp().mean().detach())
-                metrics["cycle"] += float(cycle.detach())
+                # One sample per minibatch: opt.step() updates log_std in place
+                # after every minibatch, so it drifts slightly over the course of
+                # a single update's ppo_epochs x groups loop — keep every sample
+                # (rather than just the running mean) so the spread can be
+                # reported too.
+                policy_stds.append(float(ac.log_std.exp().mean().detach()))
                 n_batches += 1
 
     n_batches = max(n_batches, 1)
-    return {k: v / n_batches for k, v in metrics.items()}
+    out = {k: v / n_batches for k, v in metrics.items()}
+    stds = np.asarray(policy_stds) if policy_stds else np.zeros(1)
+    out["policy_std"] = float(stds.mean())
+    out["policy_std_median"] = float(np.median(stds))
+    out["policy_std_min"] = float(stds.min())
+    out["policy_std_max"] = float(stds.max())
+    return out
 
 
 def train_ppo(ac: ActorCritic, envs, cfg: PPOConfig, log_fn=None) -> PPOLog:

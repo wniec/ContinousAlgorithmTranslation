@@ -8,11 +8,10 @@ optimizer's internal state (the translation), which warm-starts the target for
 the next segment.
 
 * **observation** — a dict with the source optimizer's augmented native state,
-  the source/target algorithm names, a small progress context (fraction of
-  budget used, normalized best-so-far), and 22 ``ela`` landscape features
-  (pflacco) computed from the episode's accumulated evaluations. The policy
-  turns the native state into a ``CanonicalState`` for the encoder; the progress
-  + ELA vector is a normalized side-input to the critic.
+  the source/target algorithm names, and a small progress context (fraction of
+  budget used, normalized best-so-far). The policy turns the native state into
+  a ``CanonicalState`` for the encoder; the progress vector is a normalized
+  side-input to the critic.
 * **action** — the target's full native warm-start dict (shared population +
   decoded specific fields), assembled by the policy from its decoded state.
 * **reward** — depends on ``reward_mode`` (default ``"noswitch"``):
@@ -39,7 +38,6 @@ from cat.data.collector import _augment, _has_full_state
 from cat.optimizers.base import sample_switch_points
 from cat.optimizers.portfolio import PORTFOLIO
 from cat.state.canonical import warm_start_optimizer
-from cat.suite.ela import ELA_DIM, MAX_HISTORY_SAMPLE, compute_ela_features
 
 
 # Log-scaling floor. reward = log(scaled + eps) - log(eps) = log(1 + scaled/eps)
@@ -80,9 +78,10 @@ class TranslationEnv(gym.Env):
         fe_multiplier: int = 2000,
         n_switches: int = 6,
         n_individuals: int | None = 12,
-        reward_mode: str = "noswitch",
+        n_individuals_a: int | None = None,
+        n_individuals_b: int | None = None,
+        reward_mode: str = "relative",
         switch_cdb: float = 1.0,
-        use_ela: bool = True,
         seed: int = 0,
     ):
         super().__init__()
@@ -90,14 +89,17 @@ class TranslationEnv(gym.Env):
             raise ValueError("problem_ids is empty")
         if reward_mode not in ("noswitch", "absolute", "relative"):
             raise ValueError(f"unknown reward_mode {reward_mode!r}")
-        self.use_ela = use_ela
         self.algo_a = algo_a
         self.algo_b = algo_b
         self.problem_ids = problem_ids
         self.suite = suite
         self.fe_multiplier = fe_multiplier
         self.n_switches = n_switches
+        # n_individuals is the shared fallback; n_individuals_a/b let each
+        # algorithm run with its own population size.
         self.n_individuals = n_individuals
+        self.n_a = n_individuals_a if n_individuals_a is not None else n_individuals
+        self.n_b = n_individuals_b if n_individuals_b is not None else n_individuals
         self.reward_mode = reward_mode
         self.switch_cdb = switch_cdb
         self._seed = seed
@@ -129,10 +131,11 @@ class TranslationEnv(gym.Env):
         self._src_native = None
         self._src_algo = None
         self._tgt_algo = None
-        self._hist_x = None  # accumulated evaluated points (for ELA features)
-        self._hist_y = None
 
     # ------------------------------------------------------------------ #
+
+    def _n_for(self, algo: str) -> int | None:
+        return self.n_a if algo == self.algo_a else self.n_b
 
     def _make_optimizer(self, algo: str, target_fe: int, seed_rng: int):
         options = {
@@ -144,30 +147,12 @@ class TranslationEnv(gym.Env):
             "seed_rng": seed_rng,
             "verbose": False,
         }
-        if self.n_individuals is not None:
-            options["n_individuals"] = self.n_individuals
+        n = self._n_for(algo)
+        if n is not None:
+            options["n_individuals"] = n
         opt = PORTFOLIO[algo](self._cfg, options)
         opt.n_function_evaluations = self._n_fe
         return opt
-
-    def _accumulate_history(self, result: dict) -> None:
-        """Append a run's evaluated points to the episode history (for ELA)."""
-        xh = result.get("x_history")
-        yh = result.get("y_history")
-        if xh is None or yh is None or len(xh) == 0:
-            return
-        xh = np.asarray(xh, dtype=float)
-        yh = np.asarray(yh, dtype=float)
-        if self._hist_x is None:
-            self._hist_x, self._hist_y = xh, yh
-        else:
-            self._hist_x = np.concatenate([self._hist_x, xh])[-MAX_HISTORY_SAMPLE:]
-            self._hist_y = np.concatenate([self._hist_y, yh])[-MAX_HISTORY_SAMPLE:]
-
-    def _ela(self) -> np.ndarray:
-        if self.use_ela and self._hist_x is not None:
-            return compute_ela_features(self._hist_x, self._hist_y)
-        return np.zeros(ELA_DIM, dtype=np.float32)
 
     def _observation(self) -> dict:
         frac = self._n_fe / max(self._max_fe, 1)
@@ -176,10 +161,10 @@ class TranslationEnv(gym.Env):
             "native": self._src_native,
             "source_algo": self._src_algo,
             "target_algo": self._tgt_algo,
+            "target_n": self._n_for(self._tgt_algo),
             "context": np.array(
                 [frac, np.tanh(best / max(self._range, 1e-9))], dtype=np.float32
             ),
-            "ela": self._ela(),
         }
 
     def reset(self, seed=None, options=None):
@@ -195,7 +180,9 @@ class TranslationEnv(gym.Env):
             "upper_boundary": self._problem.upper_bounds,
         }
         self._max_fe = self.fe_multiplier * dim
-        pop = self.n_individuals if self.n_individuals is not None else 20
+        # Conservative floor for switch-point spacing/probe sizing: room enough
+        # regardless of which algo (with its own population size) runs next.
+        pop = max(self.n_a or 20, self.n_b or 20)
 
         base = (self._seed * 1_000_003 + self._problem_idx) % (2**31)
         sw_rng = np.random.default_rng(base)
@@ -224,7 +211,6 @@ class TranslationEnv(gym.Env):
         self._best_y = float(y_probe[i_best])
         self._best_x = x_probe[i_best]
         self._n_fe = n_probe
-        self._hist_x, self._hist_y = x_probe, y_probe  # seed the ELA history
 
         # Warm up the first algorithm (cold) to build a genuine source state.
         warmup = self._make_optimizer(self.algo_a, self._checkpoints[0], base + 1)
@@ -232,7 +218,6 @@ class TranslationEnv(gym.Env):
         result = warmup.optimize()
         self._update_best(result)
         self._n_fe = result.get("n_function_evaluations", self._n_fe)
-        self._accumulate_history(result)
 
         # Reward scale = remaining distance to the global optimum at the end of
         # the first optimization period (the warmup). Improvements over the rest
@@ -291,9 +276,7 @@ class TranslationEnv(gym.Env):
             reward = _log_scale(translated_scaled)
 
         # Now advance the episode: the target's resulting state becomes the
-        # next source; roles swap. Only the real (switched) run feeds the ELA
-        # history — counterfactual runs are hypothetical.
-        self._accumulate_history(result)
+        # next source; roles swap.
         self._update_best(result)
         self._n_fe = result.get("n_function_evaluations", self._n_fe)
         self._src_native = _augment(opt, self.dim)

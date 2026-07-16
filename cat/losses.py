@@ -5,7 +5,15 @@ fields of very different raw scale contribute comparably:
 
 * **cycle-consistency** — the user's rule: with the population held fixed,
   ``A -> B -> A`` must change A's own algorithm-specific parameters as little as
-  possible. ``field_distance(round_trip_A, A)``.
+  possible. Two interchangeable ways to score the round trip (picked via
+  ``batch_losses(..., cycle_mode=...)``):
+    - ``"field"`` (default) — ``field_distance(round_trip_A, A)``, comparing the
+      fully decoded specific fields.
+    - ``"latent"`` — ``latent_cycle_loss``, comparing ``Encoder_A(A)`` to
+      ``Encoder_A(round_trip_A)`` directly, without ever looking at decoded
+      fields. Cheaper to game by a decoder that reproduces fields the loss
+      never inspects, but scores exactly the representation the translator
+      actually routes through, and needs no per-field weighting.
 * **reconstruction** — ``Encoder_X -> Head_X`` must reproduce X (an autoencoder
   anchor that stops the latent from collapsing).
 * **utility proxy** — the *translated* state must be a good warm-start for the
@@ -19,6 +27,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from cat.models.encoder import Latent
 from cat.models.norm import POSITION_LIKE, NormContext
 from cat.state.canonical import CanonicalState
 from cat.state.schema import Struct, get_spec
@@ -38,6 +47,27 @@ def field_distance(
         total = total + f.weight * torch.mean((p - t) ** 2)
         wsum += f.weight
     return total / max(wsum, 1e-8)
+
+
+def latent_distance(a: Latent, b: Latent) -> Tensor:
+    """MSE between two latents (dim-tokens + global vector), averaged evenly.
+
+    Unlike ``field_distance`` there is no per-field weighting to worry about:
+    both tensors already live in the same learned hidden space."""
+    tok = torch.mean((a.dim_tokens - b.dim_tokens) ** 2)
+    glob = torch.mean((a.global_vec - b.global_vec) ** 2)
+    return 0.5 * (tok + glob)
+
+
+def latent_cycle_loss(
+    pair, state: CanonicalState, back: CanonicalState, ctx: NormContext
+) -> Tensor:
+    """Cycle-consistency scored in latent space: ``Encoder_A(A)`` vs.
+    ``Encoder_A(A -> B -> A)``. ``back`` is the already-decoded round trip (e.g.
+    from ``pair.cycle``); this only adds the two re-encodes and the comparison."""
+    z_state = pair.encode(state, ctx)
+    z_back = pair.encode(back, ctx)
+    return latent_distance(z_state, z_back)
 
 
 # --------------------------------------------------------------------------- #
@@ -106,12 +136,37 @@ def utility_loss(mid: CanonicalState, ctx: NormContext) -> Tensor:
 # --------------------------------------------------------------------------- #
 
 
-def batch_losses(pair, state: CanonicalState, ctx: NormContext) -> dict[str, Tensor]:
-    """Run cycle + reconstruction + utility for one homogeneous batch."""
-    mid, back = pair.cycle(state, ctx)
+def batch_losses(
+    pair,
+    state: CanonicalState,
+    ctx: NormContext,
+    cycle_mode: str = "field",
+    w_cycle: float = 1.0,
+) -> dict[str, Tensor]:
+    """Run cycle + reconstruction + utility for one homogeneous batch.
+
+    ``cycle_mode`` picks how the ``A -> B -> A`` round trip is scored: "field"
+    (default, decoded specific fields) or "latent" (re-encoded latents only).
+    ``w_cycle == 0.0`` skips the round trip's ``B -> A`` leg (and, for "latent",
+    the re-encodes) entirely rather than computing it just to multiply by zero
+    — ``mid`` (needed by the utility proxy) is still produced via the cheaper
+    ``A -> B`` leg alone.
+    """
+    tgt = pair.other(state.algo)
+    mid = pair.translate(state, tgt, ctx)
     recon = pair.reconstruct(state, ctx)
+    if w_cycle == 0.0:
+        cycle = state.positions.new_zeros(())
+    elif cycle_mode == "field":
+        back = pair.translate(mid, state.algo, ctx)
+        cycle = field_distance(back, state, ctx)
+    elif cycle_mode == "latent":
+        back = pair.translate(mid, state.algo, ctx)
+        cycle = latent_cycle_loss(pair, state, back, ctx)
+    else:
+        raise ValueError(f"unknown cycle_mode {cycle_mode!r}")
     return {
-        "cycle": field_distance(back, state, ctx),
+        "cycle": cycle,
         "recon": field_distance(recon, state, ctx),
         "utility": utility_loss(mid, ctx),
     }

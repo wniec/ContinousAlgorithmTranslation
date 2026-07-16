@@ -51,3 +51,47 @@ def test_overfit_drives_cycle_and_recon_down():
     assert last["cycle"] < 0.5 * first["cycle"]
     assert last["recon"] < 0.5 * first["recon"]
     assert last["recon"] < 0.5  # reconstruction is an autoencoder identity
+
+
+def test_overfit_drives_latent_cycle_down():
+    torch.manual_seed(0)
+    states = _states("PSO", 12, N=10, D=3, seed=1) + _states(
+        "CMAES", 12, N=8, D=3, seed=2
+    )
+    ds = StateDataset(states)
+    pair = TranslatorPair("PSO", "CMAES", hidden=48)
+    cfg = TrainConfig(
+        epochs=60,
+        batch_size=8,
+        lr=2e-3,
+        w_utility=0.0,
+        cycle_mode="latent",
+        device="cpu",
+        log_every=0,
+    )
+    log = train(pair, ds, cfg)
+    first = log.history[0]
+    last = log.history[-1]
+    # Decoder heads start near-zero (see StateDecoder._small_init), so the
+    # latent cycle loss starts small too (both directions decode near-identical
+    # near-zero specific fields) and isn't monotone as the heads move away from
+    # that init — unlike the field-space cycle loss, which starts at genuine
+    # random-init drift. Check it stays bounded and the autoencoder anchor
+    # (recon) still drops substantially.
+    assert last["cycle"] < 0.2
+    assert last["recon"] < 0.5 * first["recon"]
+
+
+def test_w_cycle_zero_skips_cycle_computation():
+    torch.manual_seed(0)
+    states = _states("PSO", 4, N=6, D=3, seed=1) + _states("CMAES", 4, N=5, D=3, seed=2)
+    ds = StateDataset(states)
+    pair = TranslatorPair("PSO", "CMAES", hidden=16)
+    cfg = TrainConfig(
+        epochs=2, batch_size=4, w_cycle=0.0, device="cpu", log_every=0
+    )
+    log = train(pair, ds, cfg)
+    # batch_losses short-circuits to an exact, ungraphed zero rather than a
+    # near-zero value, so the "B -> A" leg is provably never run.
+    for row in log.history:
+        assert row["cycle"] == 0.0

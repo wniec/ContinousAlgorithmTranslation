@@ -36,6 +36,7 @@ class TrainConfig:
     w_cycle: float = 1.0
     w_recon: float = 1.0
     w_utility: float = 0.1
+    cycle_mode: str = "field"  # "field" (decoded fields) or "latent" (re-encoded latents)
     device: str = "cpu"
     seed: int = 42
     log_every: int = 1
@@ -68,7 +69,9 @@ def train(
         for state in dataset.iter_batches(cfg.batch_size, generator=gen):
             state = state.to(device)
             ctx = _ctx(state)
-            losses = batch_losses(pair, state, ctx)
+            losses = batch_losses(
+                pair, state, ctx, cycle_mode=cfg.cycle_mode, w_cycle=cfg.w_cycle
+            )
             total = (
                 cfg.w_cycle * losses["cycle"]
                 + cfg.w_recon * losses["recon"]

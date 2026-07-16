@@ -59,6 +59,18 @@ def parse_args():
     )
     p.add_argument("--schedule", choices=["alternate", "random"], default="alternate")
     p.add_argument("--n-individuals", type=int, default=None)
+    p.add_argument(
+        "--n-individuals-a",
+        type=int,
+        default=None,
+        help="override --n-individuals for algo_a only",
+    )
+    p.add_argument(
+        "--n-individuals-b",
+        type=int,
+        default=None,
+        help="override --n-individuals for algo_b only",
+    )
     # training
     p.add_argument("-E", "--epochs", type=int, default=30)
     p.add_argument("--batch-size", type=int, default=32)
@@ -68,6 +80,12 @@ def parse_args():
     p.add_argument("--w-cycle", type=float, default=1.0)
     p.add_argument("--w-recon", type=float, default=1.0)
     p.add_argument("--w-utility", type=float, default=0.1)
+    p.add_argument(
+        "--cycle-mode",
+        choices=["field", "latent"],
+        default="field",
+        help="score the A->B->A round trip on decoded fields or re-encoded latents",
+    )
     p.add_argument(
         "--device",
         default="auto",
@@ -112,6 +130,8 @@ def main():
             n_switches=args.n_switches,
             schedule=args.schedule,
             n_individuals=args.n_individuals,
+            n_individuals_a=args.n_individuals_a,
+            n_individuals_b=args.n_individuals_b,
             seed=args.seed,
         )
         if args.cache:
@@ -145,6 +165,7 @@ def main():
         w_cycle=args.w_cycle,
         w_recon=args.w_recon,
         w_utility=args.w_utility,
+        cycle_mode=args.cycle_mode,
         device=args.device,
         seed=args.seed,
     )

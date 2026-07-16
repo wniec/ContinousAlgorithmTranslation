@@ -155,6 +155,67 @@ def _resize_point_set(points: Tensor, m_cap: int, positions: Tensor) -> Tensor:
     return src[idx]
 
 
+def resample_population(
+    state: CanonicalState, n_target: int, rng: np.random.Generator
+) -> CanonicalState:
+    """Resize an *un-batched* state's population to exactly ``n_target`` rows.
+
+    Downsampling keeps the best ``n_target`` individuals by ``values`` —
+    mirrors the truncation every optimizer's own ``set_data``/``initialize``
+    already performs internally. Upsampling keeps every existing individual
+    and synthesizes the rest by resampling rows with replacement and jittering
+    their positions (scaled to the population's own spread); the synthesized
+    rows' ``values`` and any per-individual specific field are copied from
+    their parent row unchanged — no objective-function evaluation happens
+    here, so this is a warm-start seed, not a ground-truth fitness.
+
+    Only fields that scale with population size (shared ``positions``/
+    ``values`` plus any ``Struct.PER_PARTICLE_PER_DIM``/``PER_PARTICLE``
+    specific field, e.g. PSO's ``velocity``/``pbest_x``) are resampled;
+    per-distribution fields (``best_x``, ``best_y``, CMA-ES's mean/covariance,
+    MadDE's archive) pass through unchanged.
+    """
+    if state.positions.dim() != 2:
+        raise ValueError("resample_population expects a single un-batched state")
+    n = state.n
+    if n_target == n:
+        return state
+
+    per_row = {
+        f.name
+        for f in get_spec(state.algo).specific
+        if f.struct in (Struct.PER_PARTICLE_PER_DIM, Struct.PER_PARTICLE)
+    }
+    device = state.positions.device
+
+    if n_target < n:
+        idx = torch.argsort(state.values)[:n_target]
+    else:
+        extra = n_target - n
+        extra_idx = torch.as_tensor(
+            rng.integers(0, n, size=extra), dtype=torch.long, device=device
+        )
+        idx = torch.cat([torch.arange(n, device=device), extra_idx])
+
+    positions = state.positions[idx].clone()
+    values = state.values[idx]
+    specific = {
+        name: (val[idx] if name in per_row else val)
+        for name, val in state.specific.items()
+    }
+
+    if n_target > n:
+        std = state.positions.std(dim=0, keepdim=True).clamp_min(1e-6)
+        noise = torch.as_tensor(
+            rng.normal(size=(n_target - n, state.d)),
+            dtype=positions.dtype,
+            device=device,
+        )
+        positions[n:] = positions[n:] + 0.1 * std * noise
+
+    return CanonicalState(state.algo, positions, values, state.best_x, state.best_y, specific)
+
+
 # --------------------------------------------------------------------------- #
 # CanonicalState  ->  native dict (for set_data)                               #
 # --------------------------------------------------------------------------- #

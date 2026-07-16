@@ -112,16 +112,25 @@ class PSO(SubOptimizer):
             idx = np.argsort(y)[: self.n_individuals]
             x_sub = x[idx]
             y_sub = y[idx]
-            v = (
-                kwargs["v"]
-                if kwargs.get("v") is not None
-                else self.rng_initialization.uniform(
+
+            # ``idx`` reorders/truncates x/y; any per-particle field passed
+            # alongside them (v, p_x, p_y, n_x) must be reindexed by the same
+            # idx to stay attached to the right particle, not used as-is.
+            def _reindexed(key, fallback):
+                arr = kwargs.get(key)
+                if arr is not None and len(arr) == len(x):
+                    return arr[idx]
+                return fallback()
+
+            v = _reindexed(
+                "v",
+                lambda: self.rng_initialization.uniform(
                     self._min_v, self._max_v, self._shape
-                )
+                ),
             )
-            p_x = kwargs["p_x"] if kwargs.get("p_x") is not None else np.copy(x_sub)
-            p_y = kwargs["p_y"] if kwargs.get("p_y") is not None else np.copy(y_sub)
-            n_x = kwargs["n_x"] if kwargs.get("n_x") is not None else np.copy(x_sub)
+            p_x = _reindexed("p_x", lambda: np.copy(x_sub))
+            p_y = _reindexed("p_y", lambda: np.copy(y_sub))
+            n_x = _reindexed("n_x", lambda: np.copy(x_sub))
             if best_x is not None:
                 slot = self.rng_initialization.integers(self.n_individuals)
                 p_x[slot] = np.copy(best_x)

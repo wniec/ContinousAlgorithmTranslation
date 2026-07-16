@@ -13,8 +13,6 @@ dependencies = [
     "gymnasium>=0.29",
     "wandb>=0.27.2",
     "python-dotenv>=1.2.2",
-    "pflacco>=1.0.0",
-    "pandas>=2.0.3",
 ]
 
 [build-system]

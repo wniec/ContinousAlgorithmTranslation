@@ -122,13 +122,9 @@ python train_rl.py PSO CMAES -d 2 3 5 --n-individuals 12 \
   sampled in factor space → stays PSD).
 - **Critic**: its own encoder (decoupled from the actor) with PPO value-clipping
   and a Huber loss, so a value-function spike can't swamp the policy gradient. It
-  additionally consumes a side-input of **22 ELA landscape features** (pflacco;
-  `cat/suite/ela.py`) computed from the episode's accumulated evaluations, plus
-  the 2 progress scalars — both running-normalized. ELA feeds **only the critic**
-  (the actor/translator stays a function of the optimizer state alone, so
-  `evaluate.py` and the supervised path are unaffected). Disable with `--no-ela`.
-  Note: pflacco's information-content features JIT-compile (numba) on first call
-  (~one-time warmup) and add per-step cost.
+  additionally consumes a side-input of the 2 progress scalars (running-normalized).
+  This feeds **only the critic** (the actor/translator stays a function of the
+  optimizer state alone, so `evaluate.py` and the supervised path are unaffected).
 - **Normalization** (on by default): rewards are scaled by the running std of the
   discounted return, and the scalar context observation is standardized by its
   running mean/std — both persisted across updates so value targets and

@@ -18,7 +18,6 @@ def _env(seed=0, n_switches=4):
         fe_multiplier=200,
         n_switches=n_switches,
         n_individuals=12,
-        use_ela=False,  # keep mechanics tests fast; ELA covered in test_ela.py
         seed=seed,
     )
 
@@ -84,7 +83,6 @@ def test_relative_reward_zero_for_lossy_action():
         n_switches=4,
         n_individuals=12,
         reward_mode="relative",
-        use_ela=False,
         seed=5,
     )
     obs, _ = env.reset()
@@ -106,7 +104,6 @@ def test_noswitch_reward_bounds_and_sign():
         n_switches=4,
         n_individuals=12,
         reward_mode="noswitch",
-        use_ela=False,
         seed=5,
     )
     obs, _ = env.reset()
@@ -152,3 +149,68 @@ def test_scaled_improvement_bounds():
     assert scaled_improvement(5.0, 5.0, 5.0) == 0.0
     assert scaled_improvement(5.0, 6.0, 5.0) == 0.0  # no improvement -> 0
     assert 0.0 < scaled_improvement(10.0, 9.0, 5.0) < 1.0
+
+
+def _env_independent_sizes(seed=0, n_switches=4, n_a=8, n_b=20):
+    pids = build_problem_ids({1, 2}, dims=[2], instances=[1])
+    return TranslationEnv(
+        "PSO",
+        "CMAES",
+        pids,
+        IOHSuite(),
+        fe_multiplier=200,
+        n_switches=n_switches,
+        n_individuals_a=n_a,
+        n_individuals_b=n_b,
+        seed=seed,
+    )
+
+
+def test_target_n_reflects_each_algos_own_population_size():
+    env = _env_independent_sizes(n_a=8, n_b=20)
+    obs, _ = env.reset()
+    assert obs["source_algo"] == "PSO" and obs["target_algo"] == "CMAES"
+    assert obs["target_n"] == 20
+    obs, r, term, trunc, _ = env.step(_lossy_action(obs))
+    assert obs["target_algo"] == "PSO"
+    assert obs["target_n"] == 8
+
+
+def test_episode_runs_with_independent_population_sizes():
+    """A lossy hand-off doesn't resize (it just carries x/y verbatim), so a
+    smaller-than-target carried population makes the target optimizer's own
+    set_data/initialize discard it and cold-init instead — exactly the same
+    degenerate-source case the real PPO rollout loop already guards against
+    with source_has_full_state() (see collect_rollout in cat/rl/ppo.py).
+    Drive the env the same defensive way and confirm every completed step
+    still yields a finite reward."""
+    env = _env_independent_sizes(n_switches=4, n_a=8, n_b=20)
+    obs, _ = env.reset()
+    rewards = []
+    done = False
+    while not done:
+        if not env.source_has_full_state():
+            break
+        obs, r, term, trunc, _ = env.step(_lossy_action(obs))
+        rewards.append(r)
+        done = term or trunc
+    assert rewards  # at least the first (PSO(8) -> CMAES(20)) switch completed
+    assert all(np.isfinite(r) for r in rewards)
+
+
+def test_policy_action_native_matches_target_n():
+    """A real translator's assembled warm-start must actually be resized to
+    the target's own population size (not just the source's)."""
+    from cat.rl.policy import ActorCritic
+
+    env = _env_independent_sizes(n_a=8, n_b=20)
+    ac = ActorCritic("PSO", "CMAES", hidden=16, n_layers=1, resample_seed=0)
+    obs, _ = env.reset()
+    assert obs["native"]["x"].shape[0] == 8  # source (PSO) population
+    step = ac.act(obs)
+    assert step.native["x"].shape[0] == obs["target_n"] == 20
+
+    obs, r, term, trunc, _ = env.step(step.native)
+    assert obs["target_algo"] == "PSO"
+    step2 = ac.act(obs)
+    assert step2.native["x"].shape[0] == obs["target_n"] == 8

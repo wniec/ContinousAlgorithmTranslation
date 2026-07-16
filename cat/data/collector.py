@@ -69,6 +69,8 @@ def collect_episode(
     n_individuals: int | None,
     seed: int,
     problem_idx: int,
+    n_individuals_a: int | None = None,
+    n_individuals_b: int | None = None,
 ) -> list[Snapshot]:
     """Run one episode on *problem_id*, returning one snapshot per segment.
 
@@ -77,11 +79,21 @@ def collect_episode(
     optimizer is switched at randomized, early-biased positions rather than at
     fixed checkpoints. A snapshot of the active optimizer's state is taken at the
     end of each segment.
+
+    ``n_individuals`` is the shared fallback; ``n_individuals_a``/``_b`` let
+    each algorithm run with its own population size. A hand-off to a
+    differently-sized optimizer isn't translated here (this collector doesn't
+    use the neural translator) — the carried-forward population is simply
+    smaller than the new optimizer wants, so its own ``set_data``/
+    ``initialize`` falls back to a cold, random init, which is a perfectly
+    valid diverse snapshot for these single-state, unsupervised losses.
     """
     prob = suite.get_problem(problem_id)
     dim = prob.dimension
     max_fe = fe_multiplier * dim
-    pop = n_individuals if n_individuals is not None else 20
+    n_a = n_individuals_a if n_individuals_a is not None else n_individuals
+    n_b = n_individuals_b if n_individuals_b is not None else n_individuals
+    pop = max(n_a or 20, n_b or 20)
 
     rng = np.random.default_rng((seed * 1_000_003 + problem_idx) % (2**31))
     checkpoints = sample_switch_points(n_switches, max_fe, pop, rng)
@@ -111,8 +123,9 @@ def collect_episode(
             "seed_rng": (seed * 1_000_000 + problem_idx * 1_000 + ck) % (2**31),
             "verbose": False,
         }
-        if n_individuals is not None:
-            options["n_individuals"] = n_individuals
+        n = n_a if algo == algo_a else n_b
+        if n is not None:
+            options["n_individuals"] = n
 
         opt = PORTFOLIO[algo](cfg, options)
         opt.n_function_evaluations = n_fe
@@ -157,6 +170,8 @@ def collect_dataset(
     n_switches: int = 8,
     schedule: str = "alternate",
     n_individuals: int | None = None,
+    n_individuals_a: int | None = None,
+    n_individuals_b: int | None = None,
     seed: int = 42,
     progress: bool = True,
 ) -> list[Snapshot]:
@@ -181,6 +196,8 @@ def collect_dataset(
                 n_switches=n_switches,
                 schedule=schedule,
                 n_individuals=n_individuals,
+                n_individuals_a=n_individuals_a,
+                n_individuals_b=n_individuals_b,
                 seed=seed,
                 problem_idx=idx,
             )

@@ -26,14 +26,17 @@ from cat.models.encoder import StateEncoder
 from cat.models.layers import MLP
 from cat.models.norm import NormContext
 from cat.models.translator import TranslatorPair
-from cat.state.canonical import CanonicalState, from_canonical, to_canonical
-from cat.suite.ela import ELA_DIM
+from cat.state.canonical import (
+    CanonicalState,
+    from_canonical,
+    resample_population,
+    to_canonical,
+)
 
 PROGRESS_DIM = 2
-# The critic's side-input: progress scalars + ELA landscape features. (Only the
-# critic sees these; the actor/translator stays a function of the optimizer
-# state alone, so evaluate.py / the supervised path are unaffected by ELA.)
-CONTEXT_DIM = PROGRESS_DIM + ELA_DIM
+# The critic's side-input: progress scalars only. (Only the critic sees these;
+# the actor/translator stays a function of the optimizer state alone.)
+CONTEXT_DIM = PROGRESS_DIM
 
 
 @dataclass
@@ -61,8 +64,12 @@ class ActorCritic(nn.Module):
         n_layers: int = 2,
         cov_rank: int = 4,
         log_std_init: float = -1.0,
+        resample_seed: int | None = None,
     ):
         super().__init__()
+        # Drives the (independent of torch's RNG) population-resizing jitter in
+        # _assemble_native, so it's reproducible across runs given a seed.
+        self._resample_rng = np.random.default_rng(resample_seed)
         self.translator = TranslatorPair(
             algo_a, algo_b, hidden=hidden, n_layers=n_layers, cov_rank=cov_rank
         )
@@ -98,11 +105,10 @@ class ActorCritic(nn.Module):
         target = obs["target_algo"]
         batch = collate([src])
         ctx = _ctx(batch)
-        # The critic side-input is [progress, ELA]. `context` (when given by the
-        # PPO loop) is the running-normalized version; otherwise build it raw.
+        # The critic side-input is the progress context. `context` (when given
+        # by the PPO loop) is the running-normalized version; otherwise raw.
         if context is None:
-            ela = obs.get("ela", np.zeros(ELA_DIM, dtype=np.float32))
-            context = np.concatenate([obs["context"], ela])
+            context = obs["context"]
         context = torch.as_tensor(context, dtype=torch.float32, device=device)
 
         z = self.translator.encode(batch, ctx)
@@ -113,7 +119,7 @@ class ActorCritic(nn.Module):
         log_prob = dist.log_prob(action).sum(-1)
         value = self._value(obs["source_algo"], batch, ctx, context.unsqueeze(0))
 
-        native = self._assemble_native(action, target, batch, ctx)
+        native = self._assemble_native(action, target, batch, ctx, obs.get("target_n"))
         return Step(
             # Keep the buffered state on CPU so a long rollout doesn't accumulate
             # GPU tensors; it is moved back to the device during the update.
@@ -125,7 +131,9 @@ class ActorCritic(nn.Module):
             native=native,
         )
 
-    def _assemble_native(self, action: Tensor, target: str, batch, ctx) -> dict:
+    def _assemble_native(
+        self, action: Tensor, target: str, batch, ctx, n_target: int | None = None
+    ) -> dict:
         specific = self.translator.decoders[target].build_state(action, ctx, batch.n)
         tgt_state = CanonicalState(
             algo=target,
@@ -134,8 +142,14 @@ class ActorCritic(nn.Module):
             best_x=batch.best_x,
             best_y=batch.best_y,
             specific=specific,
-        )
-        return from_canonical(tgt_state.index(0))
+        ).index(0)
+        # The action itself is always decoded onto the *source's* own
+        # population (see act()/evaluate_actions — this keeps log-prob/PPO
+        # ratio computations independent of population resizing); only the
+        # assembled warm-start payload is resized to the target's own N.
+        if n_target is not None and n_target != tgt_state.n:
+            tgt_state = resample_population(tgt_state, n_target, self._resample_rng)
+        return from_canonical(tgt_state)
 
     # ------------------------------------------------------------------ #
     # PPO update                                                          #
@@ -167,9 +181,18 @@ class ActorCritic(nn.Module):
         value = self._value(source_algo, batch, ctx, contexts)
         return log_prob, entropy, value, batch, ctx
 
-    def cycle_drift(self, batch: CanonicalState, ctx: NormContext) -> Tensor:
-        """Mean A->B->A field drift for a batch (the cycle-consistency penalty)."""
-        from cat.losses import field_distance
+    def cycle_drift(
+        self, batch: CanonicalState, ctx: NormContext, cycle_mode: str = "field"
+    ) -> Tensor:
+        """Mean A->B->A drift for a batch (the cycle-consistency penalty), scored
+        either on decoded fields ("field", default) or re-encoded latents
+        ("latent") — see ``cat.losses`` for the rationale behind each."""
+        from cat.losses import field_distance, latent_cycle_loss
 
         _, back = self.translator.cycle(batch, ctx)
-        return field_distance(back, batch, ctx)
+        if cycle_mode == "field":
+            return field_distance(back, batch, ctx)
+        elif cycle_mode == "latent":
+            return latent_cycle_loss(self.translator, batch, back, ctx)
+        else:
+            raise ValueError(f"unknown cycle_mode {cycle_mode!r}")
