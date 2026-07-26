@@ -87,3 +87,21 @@ class TranslatorPair(nn.Module):
         mid = self.translate(state, tgt, ctx)
         back = self.translate(mid, state.algo, ctx)
         return mid, back
+
+    def cycle_drift(
+        self, state: CanonicalState, ctx: NormContext, cycle_mode: str = "field"
+    ):
+        """Mean A->B->A drift for a batch (the cycle-consistency penalty), scored
+        either on decoded fields ("field", default) or re-encoded latents
+        ("latent") — see ``cat.losses`` for the rationale behind each. Shared by
+        both RL trainers (PPO's ``ActorCritic``, TD3's ``TD3Actor``), which each
+        wrap one ``TranslatorPair`` as their actor."""
+        from cat.losses import field_distance, latent_cycle_loss
+
+        _, back = self.cycle(state, ctx)
+        if cycle_mode == "field":
+            return field_distance(back, state, ctx)
+        elif cycle_mode == "latent":
+            return latent_cycle_loss(self, state, back, ctx)
+        else:
+            raise ValueError(f"unknown cycle_mode {cycle_mode!r}")

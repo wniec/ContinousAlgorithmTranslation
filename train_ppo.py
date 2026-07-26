@@ -1,6 +1,6 @@
 """Train the state translator with PPO (reinforcement learning).
 
-    python train_rl.py PSO CMAES [options]
+    python train_ppo.py PSO CMAES [options]
 
 Each episode is a BBOB run that switches between the two named algorithms at
 log-uniformly sampled points; at every switch the policy (the set-equivariant
@@ -10,7 +10,12 @@ the A->B->A cycle drift enters as a differentiable penalty — so the network
 learns hand-offs that are both *useful* and *reversible*, optimizing the real
 (non-differentiable) objective rather than the supervised proxy in train.py.
 
-Saves a checkpoint compatible with evaluate.py (`models/<A>_<B>_rl.pt`).
+PPO's action is a stochastic Gaussian over the translator's decoded fields,
+trained on-policy. See train_td3.py for an off-policy alternative that trains
+the same continuous action deterministically with twin critics + a replay
+buffer; shared CLI/env-building logic lives in rl_common.py.
+
+Saves a checkpoint compatible with evaluate.py (`models/<A>_<B>_ppo.pt`).
 """
 
 from __future__ import annotations
@@ -21,91 +26,36 @@ import os
 import numpy as np
 import torch
 
-from cat.rl.env import TranslationEnv
 from cat.rl.policy import ActorCritic
 from cat.rl.ppo import PPOConfig, train_ppo
-from cat.optimizers.portfolio import PORTFOLIO
-from cat.tracking import WandbLogger
-from cat.suite import IOHSuite
-from cat.suite.bbob_splits import ALL_FUNCTIONS, EASY_TRAIN_FUNCTIONS, build_problem_ids
 from cat.train_loop import resolve_device, translator_meta
-
-
-def build_envs(args) -> list[TranslationEnv]:
-    funcs = EASY_TRAIN_FUNCTIONS if args.split == "easy" else ALL_FUNCTIONS
-    suite = IOHSuite()
-    envs = []
-    for dim in args.dims:
-        ids = build_problem_ids(funcs, [dim], args.instances)
-        envs.append(
-            TranslationEnv(
-                args.algo_a,
-                args.algo_b,
-                ids,
-                suite,
-                fe_multiplier=args.fe_multiplier,
-                n_switches=args.n_switches,
-                n_individuals=args.n_individuals,
-                n_individuals_a=args.n_individuals_a,
-                n_individuals_b=args.n_individuals_b,
-                reward_mode=args.reward_mode,
-                switch_cdb=args.switch_cdb,
-                seed=args.seed * 100 + dim,
-            )
-        )
-    return envs
+from rl_common import (
+    add_algo_args,
+    add_env_args,
+    add_logging_args,
+    add_runtime_args,
+    build_envs,
+    build_logger,
+)
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("algo_a", choices=sorted(PORTFOLIO))
-    p.add_argument("algo_b", choices=sorted(PORTFOLIO))
-    # problem set / episode
-    p.add_argument("-d", "--dims", type=int, nargs="+", default=[2, 3, 5])
-    p.add_argument("--instances", type=int, nargs="+", default=[1, 2, 3])
-    p.add_argument("--split", choices=["easy", "all"], default="easy")
-    p.add_argument("--fe-multiplier", type=int, default=2000)
-    p.add_argument("--n-switches", type=int, default=6)
-    p.add_argument(
-        "--n-individuals",
-        type=int,
-        default=None,
-        help="shared population size for both algos; omit (with -a/-b also "
-        "unset) to let each algorithm use its own built-in default",
-    )
-    p.add_argument(
-        "--n-individuals-a",
-        type=int,
-        default=None,
-        help="override --n-individuals for algo_a only",
-    )
-    p.add_argument(
-        "--n-individuals-b",
-        type=int,
-        default=None,
-        help="override --n-individuals for algo_b only",
-    )
-    p.add_argument(
-        "--switch-cdb",
-        type=float,
-        default=1.0,
-        help="base of the switch-point log-FE warp: 1.0 (default) = plain "
-        "log-uniform; >1 concentrates switches earlier; 0<cdb<1 later.",
-    )
-    p.add_argument(
-        "--reward-mode",
-        choices=["noswitch", "absolute", "relative"],
-        default="noswitch",
-        help="'noswitch' (default) rewards matching the no-switch counterfactual "
-        "(the source optimizer continuing); 'absolute' rewards raw improvement; "
-        "'relative' rewards improvement over the lossy default. noswitch/relative "
-        "run an extra counterfactual optimizer per step (~2x cost).",
-    )
+    add_algo_args(p)
+    add_env_args(p)
     # network
     p.add_argument("--hidden", type=int, default=64)
     p.add_argument("--n-layers", type=int, default=2)
     p.add_argument("--cov-rank", type=int, default=4)
     p.add_argument("--log-std-init", type=float, default=0.0)
+    p.add_argument(
+        "--std-lr-mult",
+        type=float,
+        default=30.0,
+        help="log_std gets its own Adam param group at lr * std-lr-mult, since "
+        "it's a single global scalar that needs a much bigger step than the "
+        "rest of the network to track its optimum in a reasonable number of updates",
+    )
     p.add_argument(
         "--resample-seed",
         type=int,
@@ -129,7 +79,7 @@ def parse_args():
     p.add_argument("--gae-lambda", type=float, default=0.5)
     p.add_argument("--clip", type=float, default=0.4)
     p.add_argument("--ent-coef", type=float, default=0.0)
-    p.add_argument("--vf-coef", type=float, default=0.05)
+    p.add_argument("--vf-coef", type=float, default=0.03)
     p.add_argument("--lambda-cycle", type=float, default=0.0)
     p.add_argument(
         "--cycle-mode",
@@ -150,19 +100,8 @@ def parse_args():
         help="disable observation (context) normalization",
     )
     p.add_argument("--lr", type=float, default=8e-5)
-    p.add_argument(
-        "--device",
-        default="auto",
-        help="'auto' uses CUDA when available else CPU; or pass cuda / cuda:0 / cpu / mps",
-    )
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--out", default=None)
-    # logging
-    p.add_argument(
-        "--wandb", action="store_true", help="log metrics to Weights & Biases"
-    )
-    p.add_argument("--wandb-project", default=None)
-    p.add_argument("--wandb-run-name", default=None)
+    add_runtime_args(p)
+    add_logging_args(p)
     return p.parse_args()
 
 
@@ -174,7 +113,7 @@ def main():
 
     envs = build_envs(args)
     print(
-        f"RL training {args.algo_a}<->{args.algo_b} | dims={args.dims} "
+        f"PPO training {args.algo_a}<->{args.algo_b} | dims={args.dims} "
         f"| {len(envs)} env(s) | n_switches={args.n_switches} | device={args.device}"
     )
 
@@ -201,23 +140,17 @@ def main():
         lambda_cycle=args.lambda_cycle,
         cycle_mode=args.cycle_mode,
         lr=args.lr,
+        std_lr_mult=args.std_lr_mult,
         norm_reward=args.norm_reward,
         norm_obs=args.norm_obs,
         device=args.device,
         seed=args.seed,
     )
-    logger = WandbLogger(
-        enabled=args.wandb,
-        project=args.wandb_project,
-        run_name=args.wandb_run_name or f"ppo_{args.algo_a}_{args.algo_b}",
-        group=f"{args.algo_a}_{args.algo_b}",
-        config={**vars(args), "trainer": "ppo"},
-        x_axis="update",
-    )
+    logger = build_logger(args, "ppo")
     ppo_log = train_ppo(ac, envs, cfg, log_fn=logger.log)
     logger.finish()
 
-    out = args.out or os.path.join("models", f"{args.algo_a}_{args.algo_b}_rl.pt")
+    out = args.out or os.path.join("models", f"{args.algo_a}_{args.algo_b}_ppo.pt")
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     # Save the actor's TranslatorPair under "state_dict" so evaluate.py /
     # load_translator can consume it directly; keep the full actor-critic and the
@@ -232,7 +165,7 @@ def main():
     if ppo_log.obs_rms is not None:
         ckpt["obs_rms"] = ppo_log.obs_rms.state_dict()
     torch.save(ckpt, out)
-    print(f"saved RL translator to {out}")
+    print(f"saved PPO translator to {out}")
 
 
 if __name__ == "__main__":

@@ -24,7 +24,7 @@ import torch
 import torch.nn.functional as F
 
 from cat.rl.env import TranslationEnv
-from cat.rl.normalize import RunningMeanStd
+from cat.rl.normalize import RunningMeanStd, normalize_rewards
 from cat.rl.policy import CONTEXT_DIM, ActorCritic, Step
 
 
@@ -42,6 +42,11 @@ class PPOConfig:
     lambda_cycle: float = 0.05
     cycle_mode: str = "field"  # "field" (decoded fields) or "latent" (re-encoded latents)
     lr: float = 3e-4
+    # log_std is a single global scalar (see ActorCritic.log_std): at the shared
+    # network lr it can only drift by ~lr per opt.step(), which is too slow to
+    # track a moving optimum over the handful of steps in one update. Give it
+    # its own Adam param group at lr * std_lr_mult instead.
+    std_lr_mult: float = 20.0
     max_grad_norm: float = 1.0
     # Sliding-window rollout buffer: each update collects ~rollout_steps fresh
     # transitions, appends them to a deque of this capacity, and trains on the
@@ -114,18 +119,6 @@ def _gae(rewards, values, gamma, lam):
     return adv, returns
 
 
-def _normalize_rewards(rewards: list[float], gamma: float, ret_rms: RunningMeanStd):
-    """Scale rewards by the running std of the discounted return (PPO standard)."""
-    R = 0.0
-    discounted = []
-    for r in rewards:
-        R = gamma * R + r
-        discounted.append(R)
-    ret_rms.update(np.asarray(discounted)[:, None])
-    std = float(ret_rms.std.item()) + 1e-8
-    return [r / std for r in rewards]
-
-
 def collect_rollout(
     ac: ActorCritic,
     envs,
@@ -133,16 +126,22 @@ def collect_rollout(
     ep_rng,
     ret_rms: RunningMeanStd | None = None,
     obs_rms: RunningMeanStd | None = None,
-) -> tuple[list[Transition], list[float]]:
+) -> tuple[list[Transition], list[float], dict[str, list[float]]]:
     """Run whole episodes until at least rollout_steps transitions are gathered.
 
     Reward normalization (``ret_rms``) and context/observation normalization
     (``obs_rms``) use running statistics that persist across updates; the
     normalized context is stored in each transition so the PPO update is
     consistent with what the policy saw at collection time.
+
+    The third return value maps each switch type (``"<source>-><target>"``) to
+    its raw per-step rewards, but only under the ``relative`` reward mode — the
+    one mode whose reward is directly comparable across the two hand-off
+    directions (each is an improvement over that same direction's lossy default).
     """
     transitions: list[Transition] = []
     ep_returns: list[float] = []
+    switch_rewards: dict[str, list[float]] = defaultdict(list)
     while len(transitions) < cfg.rollout_steps:
         env: TranslationEnv = envs[ep_rng.integers(len(envs))]
         obs, _ = env.reset()
@@ -159,19 +158,22 @@ def collect_rollout(
                 ctx = obs_rms.normalize(raw_ctx)
             else:
                 ctx = raw_ctx
+            switch = f"{obs['source_algo']}->{obs['target_algo']}"
             step = ac.act(obs, device=cfg.device, context=ctx)
             next_obs, reward, term, trunc, _ = env.step(step.native)
             ep.append(Transition(step=step, reward=reward, context=ctx))
             rewards.append(reward)
             values.append(step.value)
             contexts.append(ctx)
+            if env.reward_mode == "relative":
+                switch_rewards[switch].append(reward)  # raw, per switch direction
             done = term or trunc
             obs = next_obs
         if not ep:
             continue
         ep_returns.append(float(sum(rewards)))  # report the RAW return
         train_rewards = (
-            _normalize_rewards(rewards, cfg.gamma, ret_rms)
+            normalize_rewards(rewards, cfg.gamma, ret_rms)
             if ret_rms is not None
             else rewards
         )
@@ -179,7 +181,7 @@ def collect_rollout(
         for tr, a, r in zip(ep, adv, ret):
             tr.adv, tr.ret = a, r
         transitions.extend(ep)
-    return transitions, ep_returns
+    return transitions, ep_returns, switch_rewards
 
 
 def _group_key(tr: Transition):
@@ -272,19 +274,24 @@ def update(ac: ActorCritic, opt, transitions: list[Transition], cfg: PPOConfig) 
                 metrics["policy_loss"] += float(policy_loss.detach())
                 metrics["value_loss"] += float(value_loss.detach())
                 metrics["cycle"] += float(cycle.detach())
-                # Log the exploration scale (policy std) rather than the summed
-                # differential entropy: std is sign-stable and independent of the
-                # action dimension, which varies across (PSO/CMA-ES)-target groups.
-                # One sample per minibatch: opt.step() updates log_std in place
-                # after every minibatch, so it drifts slightly over the course of
-                # a single update's ppo_epochs x groups loop — keep every sample
-                # (rather than just the running mean) so the spread can be
-                # reported too.
-                policy_stds.append(float(ac.log_std.exp().mean().detach()))
                 n_batches += 1
 
     n_batches = max(n_batches, 1)
     out = {k: v / n_batches for k, v in metrics.items()}
+    # Log the exploration scale (policy std) rather than the summed differential
+    # entropy: std is sign-stable and independent of the action dimension, which
+    # varies across (PSO/CMA-ES)-target groups. The summary spread ranges over
+    # the per-segment stds (ActorCritic.log_std) at the end of the update — the
+    # segments are what can actually diverge from one another; each also gets its
+    # own named series so the individual field kinds are visible.
+    with torch.no_grad():
+        for algo, p in ac.log_std.items():
+            seg_std = p.exp()
+            for name, s in zip(
+                ac.translator.decoders[algo].segment_names(), seg_std.tolist()
+            ):
+                out[f"policy_std/{algo}.{name}"] = s
+            policy_stds.extend(seg_std.tolist())
     stds = np.asarray(policy_stds) if policy_stds else np.zeros(1)
     out["policy_std"] = float(stds.mean())
     out["policy_std_median"] = float(np.median(stds))
@@ -300,7 +307,16 @@ def train_ppo(ac: ActorCritic, envs, cfg: PPOConfig, log_fn=None) -> PPOLog:
     returned log as ``log.ret_rms`` / ``log.obs_rms`` so they can be checkpointed.
     """
     ac.to(cfg.device)
-    opt = torch.optim.Adam(ac.parameters(), lr=cfg.lr)
+    other_params = [
+        p for n, p in ac.named_parameters() if not n.startswith("log_std.")
+    ]
+    opt = torch.optim.Adam(
+        [
+            {"params": other_params},
+            {"params": list(ac.log_std.values()), "lr": cfg.lr * cfg.std_lr_mult},
+        ],
+        lr=cfg.lr,
+    )
     ep_rng = np.random.default_rng(cfg.seed)
     log = PPOLog()
     ret_rms = RunningMeanStd(()) if cfg.norm_reward else None
@@ -313,13 +329,18 @@ def train_ppo(ac: ActorCritic, envs, cfg: PPOConfig, log_fn=None) -> PPOLog:
     buffer = RolloutBuffer(capacity)
 
     for u in range(cfg.updates):
-        fresh, ep_returns = collect_rollout(ac, envs, cfg, ep_rng, ret_rms, obs_rms)
+        fresh, ep_returns, switch_rewards = collect_rollout(
+            ac, envs, cfg, ep_rng, ret_rms, obs_rms
+        )
         buffer.extend(fresh)
         m = update(ac, opt, buffer.as_list(), cfg)
         m["update"] = u
         # Report the raw return of the freshly collected episodes only, so the
         # learning curve reflects the current policy (not stale window records).
         m["mean_return"] = float(np.mean(ep_returns)) if ep_returns else 0.0
+        # Per-switch-direction mean reward (relative mode only; empty otherwise).
+        for switch, rs in switch_rewards.items():
+            m[f"reward/{switch}"] = float(np.mean(rs))
         m["n_transitions"] = len(buffer)
         m["n_fresh"] = len(fresh)
         log.history.append(m)

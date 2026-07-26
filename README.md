@@ -65,9 +65,9 @@ cp .env.example .env      # then edit WANDB_API_KEY / WANDB_PROJECT / WANDB_ENTI
 ```
 
 Then pass `--wandb` (optionally `--wandb-project` / `--wandb-run-name`) to
-`train.py` or `train_rl.py`. Per-epoch (supervised) or per-update (PPO) metrics
-are logged. Set `WANDB_MODE=offline` to sync later, or `disabled` to turn it off.
-Without `--wandb` nothing W&B-related is touched.
+`train.py`, `train_ppo.py`, or `train_td3.py`. Per-epoch (supervised) or
+per-update (RL) metrics are logged. Set `WANDB_MODE=offline` to sync later, or
+`disabled` to turn it off. Without `--wandb` nothing W&B-related is touched.
 
 ## Train
 
@@ -90,22 +90,34 @@ Key flags: `-d/--dims`, `--split {easy,all}`, `--schedule {alternate,random}`,
 population size — recommended when pairing a swarm with an ES), and the loss
 weights `--w-cycle/--w-recon/--w-utility`.
 
-## Train with reinforcement learning (PPO)
+## Train with reinforcement learning (PPO or TD3)
 
 The supervised utility term is only a *proxy* for what we actually want — that
 the translated state makes the target optimizer optimize well, which is
-non-differentiable. The RL trainer optimizes that true objective directly with
-PPO over a Gymnasium environment, reusing the **same** set-equivariant network as
-the policy:
+non-differentiable. The RL trainers optimize that true objective directly over a
+Gymnasium environment, reusing the **same** set-equivariant network as the
+policy. Two interchangeable trainers are provided; they share their environment,
+CLI, and W&B/checkpoint plumbing (`rl_common.py`) and differ only in the
+learning algorithm:
 
 ```bash
-python train_rl.py PSO CMAES -d 2 3 5 --n-individuals 12 \
+# on-policy, stochastic-action PPO
+python train_ppo.py PSO CMAES -d 2 3 5 --n-individuals 12 \
+    --n-switches 6 --fe-multiplier 2000 --updates 100 --rollout-steps 1024
+
+# off-policy, deterministic-action TD3 (twin critics + replay buffer)
+python train_td3.py PSO CMAES -d 2 3 5 --n-individuals 12 \
     --n-switches 6 --fe-multiplier 2000 --updates 100 --rollout-steps 1024
 ```
 
+Shared across both trainers:
+
 - **Environment** (`cat/rl/env.py`, a `gymnasium.Env`): one episode is a BBOB run
   with log-sampled switch points; the observation is the source optimizer's
-  state, the action is the target optimizer's state (the translation).
+  state, the action is the target optimizer's state (the translation). Each algo
+  may run its own population size (`--n-individuals-a` / `--n-individuals-b`); the
+  action is decoded onto the source's `N` and the assembled warm-start resized to
+  the target's, so the action dimension stays a pure function of `(algo, D, N)`.
 - **Reward** (`--reward-mode`, all scaled by the **initial gap to the global
   optimum** — warmup best-so-far minus the BBOB optimum):
   - `noswitch` **(default)** — the translation should make the switch
@@ -114,16 +126,19 @@ python train_rl.py PSO CMAES -d 2 3 5 --n-individuals 12 \
     optimizer simply continuing), and the reward is the *similarity* of the two,
     `−|Δ best| / gap` (0 = the switched trajectory matches no-switch exactly).
   - `absolute` — log-scaled best-so-far improvement over the segment.
-  - `relative` — log-scaled improvement over the lossy default hand-off.
+  - `relative` — log-scaled improvement over the lossy default hand-off. Because
+    each direction's reward is measured against *that direction's* own lossy
+    default, the two hand-off directions are comparable, so this mode also logs
+    a per-direction mean reward (`reward/PSO->CMAES`, `reward/CMAES->PSO`).
 
   `noswitch` and `relative` run an extra counterfactual optimizer per step
   (~2× cost).
-- **Action**: a Gaussian policy over the decoded target fields (covariance
-  sampled in factor space → stays PSD).
-- **Critic**: its own encoder (decoupled from the actor) with PPO value-clipping
-  and a Huber loss, so a value-function spike can't swamp the policy gradient. It
-  additionally consumes a side-input of the 2 progress scalars (running-normalized).
-  This feeds **only the critic** (the actor/translator stays a function of the
+- **Action**: the decoded target fields, with the covariance emitted in factor
+  space → stays PSD. PPO puts a Gaussian over these coordinates; TD3 acts
+  deterministically and adds exploration noise (see below).
+- **Critic**: its own encoder (decoupled from the actor). It additionally
+  consumes a side-input of the 2 progress scalars (running-normalized). This
+  feeds **only the critic** (the actor/translator stays a function of the
   optimizer state alone, so `evaluate.py` and the supervised path are unaffected).
 - **Normalization** (on by default): rewards are scaled by the running std of the
   discounted return, and the scalar context observation is standardized by its
@@ -133,12 +148,35 @@ python train_rl.py PSO CMAES -d 2 3 5 --n-individuals 12 \
   `--no-norm-reward` / `--no-norm-obs`. (Logged `return` is always the raw value.)
 - **Cycle-consistency** enters as a differentiable penalty (`--lambda-cycle`),
   keeping the `A→B→A`-minimal condition in the objective.
-- **PPO** (`cat/rl/ppo.py`): a custom loop (no SB3) so it handles variable `D`/`N`
+- **Grouping**: both loops are custom (no SB3) so they handle variable `D`/`N`
   and the structured covariance action; minibatches are grouped by
-  `(target_algo, D, N)`.
+  `(target_algo, D, N)` so every batch is shape-homogeneous.
 
-Saves `models/PSO_CMAES_rl.pt`, which `evaluate.py` consumes directly
-(`--model models/PSO_CMAES_rl.pt`).
+**PPO** (`cat/rl/ppo.py`, on-policy): clipped-surrogate + GAE over a
+sliding-window rollout buffer, with PPO value-clipping and a Huber value loss so
+a value-function spike can't swamp the policy gradient. Exploration is a learned
+Gaussian whose log-std is **per action segment per target algorithm** (e.g.
+CMA-ES's mean/evolution-paths, its covariance factor, and PSO's per-particle
+velocities each get their own std) — a single global scalar can't express the
+different natural scales of those fields. The log-std sits in its own optimizer
+param group at `lr × --std-lr-mult`, since one scalar needs a far larger step
+than the rest of the network to track its optimum. Saves
+`models/PSO_CMAES_ppo.pt`.
+
+**TD3** (`cat/rl/td3.py`, off-policy): a deterministic actor (the translator's
+mean action, no learned std) with twin critics — `min(Q1, Q2)` targets, delayed
+& Polyak-averaged target networks, and target-policy smoothing — trained from a
+replay buffer. Exploration is fixed-scale Gaussian noise added to the action
+during rollout (`--expl-noise`); there is no decay schedule, so the
+exploration/exploitation balance is constant over training. Because the action
+dimension varies with `(algo, D, N)`, the critic can't concatenate a fixed-size
+`(state, action)`: instead the action is decoded back into a `CanonicalState`
+(parameter-free, so replayed off-policy actions reconstruct identically) and
+encoded with the target algo's own `StateEncoder` — an "action-as-state" critic.
+Saves `models/PSO_CMAES_td3.pt`.
+
+Either checkpoint is consumed directly by `evaluate.py`
+(`--model models/PSO_CMAES_ppo.pt` or `..._td3.pt`).
 
 ## Evaluate (the headline metric)
 
@@ -169,11 +207,13 @@ cat/
 ├── models/          # norm, set-equivariant layers, encoder, heads, translator
 ├── losses.py        # cycle + reconstruction + utility-proxy
 ├── train_loop.py    # supervised training orchestration + checkpoint io
-└── rl/              # RL path: env (gymnasium), policy (actor-critic), ppo
+└── rl/              # RL path: env (gymnasium), policy (actor-critic), ppo, td3
 train.py             # supervised:  python train.py <ALG_A> <ALG_B>
-train_rl.py          # PPO:         python train_rl.py <ALG_A> <ALG_B>
-evaluate.py          # translated vs lossy vs cold hand-off (loads either checkpoint)
-tests/               # round-trip, equivariance/PSD, overfit, RL env + PPO
+train_ppo.py         # PPO (on-policy):   python train_ppo.py <ALG_A> <ALG_B>
+train_td3.py         # TD3 (off-policy):  python train_td3.py <ALG_A> <ALG_B>
+rl_common.py         # shared RL CLI args + env/logger construction
+evaluate.py          # translated vs lossy vs cold hand-off (loads any checkpoint)
+tests/               # round-trip, equivariance/PSD, overfit, RL env + PPO + TD3
 ```
 
 Adding a new algorithm to the study: see

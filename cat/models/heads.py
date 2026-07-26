@@ -109,6 +109,25 @@ class StateDecoder(nn.Module):
             total += n
         return total
 
+    def segment_names(self) -> list[str]:
+        """Ordered segment names of the flat action. Which segments exist depends
+        only on the algorithm's schema — D and N change their *sizes*, not their
+        presence — so this is a fixed, small per-algorithm list. The RL policy
+        uses it to give each field kind its own exploration std (see
+        ``cat.rl.policy.ActorCritic.log_std``)."""
+        return [name for name, _ in self._layout(1, 1)]
+
+    def segment_sizes(self, D: int, N: int) -> list[int]:
+        """Element count of each segment, in ``segment_names()`` order (they sum
+        to ``action_dim(D, N)``)."""
+        sizes = []
+        for _, shape in self._layout(D, N):
+            n = 1
+            for s in shape:
+                n *= s
+            sizes.append(n)
+        return sizes
+
     def action_mean(self, z: Latent, positions: Tensor, ctx: NormContext) -> Tensor:
         """Flat normalized action-mean coordinates, shape (B, action_dim)."""
         tokens = z.dim_tokens  # (B, D, H)

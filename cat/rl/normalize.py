@@ -1,15 +1,16 @@
-"""Running mean/std estimators for PPO reward and observation normalization.
+"""Running mean/std estimators for reward and observation normalization.
 
 ``RunningMeanStd`` uses Welford/parallel moments so statistics accumulate stably
-across the whole training run (not just one rollout). Two uses:
+across the whole training run (not just one rollout). Two uses, shared by both
+the PPO (``cat/rl/ppo.py``) and TD3 (``cat/rl/td3.py``) trainers:
 
 * **reward normalization** — rewards are divided by the running std of the
   *discounted return* (the standard PPO/`VecNormalize` trick), which keeps the
-  value targets and advantages at ~unit scale even though the log-scaled,
-  optimum-relative reward can vary a lot across problems.
-* **observation normalization** — the scalar context vector fed to the critic is
-  standardized by its running mean/std. (The structured optimizer state is
-  already per-sample normalized inside the network via ``NormContext``.)
+  value targets (and, for PPO, advantages) at ~unit scale even though the
+  log-scaled, optimum-relative reward can vary a lot across problems.
+* **observation normalization** — the scalar context vector fed to the critic /
+  Q-network is standardized by its running mean/std. (The structured optimizer
+  state is already per-sample normalized inside the network via ``NormContext``.)
 """
 
 from __future__ import annotations
@@ -59,3 +60,22 @@ class RunningMeanStd:
         self.mean = np.asarray(d["mean"], dtype=np.float64)
         self.var = np.asarray(d["var"], dtype=np.float64)
         self.count = float(d["count"])
+
+
+def normalize_rewards(
+    rewards: list[float], gamma: float, ret_rms: RunningMeanStd
+) -> list[float]:
+    """Scale one episode's rewards by the running std of the discounted return
+    (the standard PPO/``VecNormalize`` trick; see module docstring). Divides by
+    std only — no mean-centering, since the raw reward's sign/magnitude carries
+    real signal (e.g. the default ``noswitch`` env reward is one-sided, always
+    <= 0) that a value/Q function should learn to predict, not have subtracted
+    away."""
+    R = 0.0
+    discounted = []
+    for r in rewards:
+        R = gamma * R + r
+        discounted.append(R)
+    ret_rms.update(np.asarray(discounted)[:, None])
+    std = float(ret_rms.std.item()) + 1e-8
+    return [r / std for r in rewards]

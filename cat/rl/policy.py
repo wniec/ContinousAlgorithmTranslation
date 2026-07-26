@@ -2,9 +2,10 @@
 
 The **actor** is the existing set-equivariant ``TranslatorPair``: it encodes the
 source optimizer's state and decodes the *mean* action (the target's specific
-fields, in normalized coordinates). A diagonal Gaussian with a learnable global
-log-std turns that mean into a stochastic policy; the covariance action is
-sampled in factor space so it stays PSD. The **critic** is a small MLP on the
+fields, in normalized coordinates). A diagonal Gaussian with a learnable
+per-segment log-std (see ``ActorCritic.log_std``) turns that mean into a
+stochastic policy; the covariance action is sampled in factor space so it stays
+PSD. The **critic** is a small MLP on the
 encoder's global latent plus the env context vector.
 
 The same network thus serves supervised translation (deterministic mean) and RL
@@ -82,9 +83,36 @@ class ActorCritic(nn.Module):
             {a: StateEncoder(a, hidden, n_layers) for a in (algo_a, algo_b)}
         )
         self.critic = MLP([hidden + CONTEXT_DIM, hidden, 1])
-        self.log_std = nn.Parameter(torch.full((1,), float(log_std_init)))
+        # One log-std *per action segment per target algorithm*, not one global
+        # scalar. A single scalar forces one exploration scale onto fields with
+        # very different natural magnitudes (CMA-ES's sigma vs. its covariance
+        # factor vs. PSO's per-particle velocities) and makes the logged
+        # min/median/max std degenerate — there is nothing for them to range
+        # over. Per-*element* stds are impossible here (the action dimension
+        # varies with D and N), but the segment list is fixed per algorithm
+        # (StateDecoder.segment_names), so this is the finest shape-invariant
+        # granularity available.
+        self.log_std = nn.ParameterDict(
+            {
+                a: nn.Parameter(
+                    torch.full(
+                        (len(self.translator.decoders[a].segment_names()),),
+                        float(log_std_init),
+                    )
+                )
+                for a in (algo_a, algo_b)
+            }
+        )
         self.algo_a = algo_a
         self.algo_b = algo_b
+
+    def action_std(self, target_algo: str, d: int, n: int) -> Tensor:
+        """Per-coordinate std, shape ``(action_dim(d, n),)`` — each segment's own
+        log-std broadcast across the coordinates it owns."""
+        dec = self.translator.decoders[target_algo]
+        log_std = self.log_std[target_algo]
+        sizes = torch.tensor(dec.segment_sizes(d, n), device=log_std.device)
+        return log_std.repeat_interleave(sizes).exp()
 
     def _value(self, source_algo: str, batch, ctx, context: Tensor) -> Tensor:
         zc = self.critic_encoders[source_algo](batch, ctx)
@@ -113,7 +141,7 @@ class ActorCritic(nn.Module):
 
         z = self.translator.encode(batch, ctx)
         mean = self.translator.decoders[target].action_mean(z, batch.positions, ctx)
-        std = self.log_std.exp()
+        std = self.action_std(target, batch.d, batch.n)
         dist = Normal(mean, std)
         action = mean if deterministic else dist.rsample()
         log_prob = dist.log_prob(action).sum(-1)
@@ -174,7 +202,7 @@ class ActorCritic(nn.Module):
         mean = self.translator.decoders[target_algo].action_mean(
             z, batch.positions, ctx
         )
-        std = self.log_std.exp()
+        std = self.action_std(target_algo, batch.d, batch.n)
         dist = Normal(mean, std)
         log_prob = dist.log_prob(actions).sum(-1)
         entropy = dist.entropy().sum(-1)
@@ -184,15 +212,6 @@ class ActorCritic(nn.Module):
     def cycle_drift(
         self, batch: CanonicalState, ctx: NormContext, cycle_mode: str = "field"
     ) -> Tensor:
-        """Mean A->B->A drift for a batch (the cycle-consistency penalty), scored
-        either on decoded fields ("field", default) or re-encoded latents
-        ("latent") — see ``cat.losses`` for the rationale behind each."""
-        from cat.losses import field_distance, latent_cycle_loss
-
-        _, back = self.translator.cycle(batch, ctx)
-        if cycle_mode == "field":
-            return field_distance(back, batch, ctx)
-        elif cycle_mode == "latent":
-            return latent_cycle_loss(self.translator, batch, back, ctx)
-        else:
-            raise ValueError(f"unknown cycle_mode {cycle_mode!r}")
+        """Mean A->B->A drift for a batch (the cycle-consistency penalty); see
+        ``TranslatorPair.cycle_drift`` (shared with TD3's ``TD3Actor``)."""
+        return self.translator.cycle_drift(batch, ctx, cycle_mode)

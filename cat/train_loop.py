@@ -122,8 +122,8 @@ def save_translator(pair: TranslatorPair, path: str, cfg: TrainConfig) -> None:
 def load_translator(path: str, device="cpu") -> TranslatorPair:
     """Rebuild a TranslatorPair from a supervised or RL checkpoint.
 
-    RL checkpoints (train_rl.py) store the actor's TranslatorPair under the same
-    ``state_dict`` key, so this loads both transparently.
+    RL checkpoints (train_ppo.py, train_td3.py) store the actor's TranslatorPair
+    under the same ``state_dict`` key, so this loads all three transparently.
     """
     ckpt = torch.load(path, map_location=device, weights_only=False)
     pair = TranslatorPair(
