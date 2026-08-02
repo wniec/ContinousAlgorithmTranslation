@@ -21,7 +21,7 @@ import torch
 from torch import Tensor, nn
 
 from cat.models.layers import MLP, DimAttention, ParticlePool
-from cat.models.norm import POSITION_LIKE, NormContext
+from cat.models.norm import _CLIP, POSITION_LIKE, NormContext
 from cat.state.canonical import CanonicalState
 from cat.state.schema import Struct, get_spec
 
@@ -45,7 +45,12 @@ class StateEncoder(nn.Module):
             f for f in spec.specific if f.struct is Struct.PER_PARTICLE_PER_DIM
         ]
         self.pd_fields = [f for f in spec.specific if f.struct is Struct.PER_DIM]
-        self.has_cov = any(f.struct is Struct.MATRIX for f in spec.specific)
+        # Name of the algorithm's MATRIX field, if any (CMA-ES: "sigma_cov";
+        # BOBYQA: "hessian"). Folded into the attention's covariance bias below.
+        self.cov_name = next(
+            (f.name for f in spec.specific if f.struct is Struct.MATRIX), None
+        )
+        self.has_cov = self.cov_name is not None
         self.scalar_fields = [f for f in spec.specific if f.struct is Struct.SCALAR]
         self.set_fields = [f for f in spec.specific if f.struct is Struct.POINT_SET]
 
@@ -122,7 +127,7 @@ class StateEncoder(nn.Module):
         xc = pos_n - pos_n.mean(dim=1, keepdim=True)
         cov_emp = xc.transpose(1, 2) @ xc / max(pos_n.shape[1], 1)
         if self.has_cov:
-            cov_n = ctx.normalize(state.specific["sigma_cov"], Struct.MATRIX, False)
+            cov_n = ctx.normalize(state.specific[self.cov_name], Struct.MATRIX, False)
             cov_emp = cov_emp + cov_n
         for f in self.set_fields:  # add the archive's empirical covariance
             pts_n = ctx.normalize(state.specific[f.name], Struct.POINT_SET, True)
@@ -133,7 +138,14 @@ class StateEncoder(nn.Module):
     def _global_scalars(self, state, ctx, N: int, D: int) -> Tensor:
         B = state.positions.shape[0]
         device = state.positions.device
-        best_y_std = ((state.best_y - ctx.val_mean) / ctx.val_std).reshape(B, 1)
+        # Clamp to the same band as every other normalized feature: a *converged*
+        # population (near-identical values) drives ``val_std`` to its 1e-6 floor,
+        # which would otherwise blow this ratio up to ~1e6 and — since it feeds
+        # the critic MLP linearly — make the value prediction (and its Huber loss)
+        # explode. Strong local methods like BOBYQA hit this regime often.
+        best_y_std = (
+            ((state.best_y - ctx.val_mean) / ctx.val_std).reshape(B, 1).clamp(-_CLIP, _CLIP)
+        )
         log_n = torch.full((B, 1), float(N), device=device).log1p()
         log_d = torch.full((B, 1), float(D), device=device).log1p()
         feats = [best_y_std, log_n, log_d]

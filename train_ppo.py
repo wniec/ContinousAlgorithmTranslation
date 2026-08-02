@@ -77,7 +77,7 @@ def parse_args():
     p.add_argument("--minibatch-size", type=int, default=256)
     p.add_argument("--gamma", type=float, default=0.8)
     p.add_argument("--gae-lambda", type=float, default=0.5)
-    p.add_argument("--clip", type=float, default=0.4)
+    p.add_argument("--clip", type=float, default=0.25)
     p.add_argument("--ent-coef", type=float, default=0.0)
     p.add_argument("--vf-coef", type=float, default=0.03)
     p.add_argument("--lambda-cycle", type=float, default=0.0)
@@ -99,7 +99,7 @@ def parse_args():
         action="store_false",
         help="disable observation (context) normalization",
     )
-    p.add_argument("--lr", type=float, default=8e-5)
+    p.add_argument("--lr", type=float, default=1e-4)
     add_runtime_args(p)
     add_logging_args(p)
     return p.parse_args()

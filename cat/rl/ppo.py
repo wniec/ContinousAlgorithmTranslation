@@ -135,9 +135,15 @@ def collect_rollout(
     consistent with what the policy saw at collection time.
 
     The third return value maps each switch type (``"<source>-><target>"``) to
-    its raw per-step rewards, but only under the ``relative`` reward mode — the
-    one mode whose reward is directly comparable across the two hand-off
-    directions (each is an improvement over that same direction's lossy default).
+    its raw per-step rewards, under the ``relative`` and ``noswitch`` reward
+    modes — the two whose reward is directly comparable across the hand-off
+    directions (each is a log-scaled improvement over that same direction's own
+    baseline: the lossy default for ``relative``, the source continuing for
+    ``noswitch``). ``absolute`` is a raw, scale-varying improvement, so it is
+    not broken out per direction. In ``mixed`` mode the same dict additionally
+    carries the two additive components under the keys ``mixed_noswitch`` and
+    ``mixed_relative`` (aggregated over all directions), so each part's mean is
+    logged alongside the per-direction totals.
     """
     transitions: list[Transition] = []
     ep_returns: list[float] = []
@@ -160,13 +166,17 @@ def collect_rollout(
                 ctx = raw_ctx
             switch = f"{obs['source_algo']}->{obs['target_algo']}"
             step = ac.act(obs, device=cfg.device, context=ctx)
-            next_obs, reward, term, trunc, _ = env.step(step.native)
+            next_obs, reward, term, trunc, info = env.step(step.native)
             ep.append(Transition(step=step, reward=reward, context=ctx))
             rewards.append(reward)
             values.append(step.value)
             contexts.append(ctx)
-            if env.reward_mode == "relative":
+            if env.reward_mode in ("relative", "noswitch", "mixed"):
                 switch_rewards[switch].append(reward)  # raw, per switch direction
+            # In 'mixed' mode also break out the two additive components so each
+            # part's mean is logged (reward/mixed_noswitch, reward/mixed_relative).
+            for part, value in info.get("reward_parts", {}).items():
+                switch_rewards[part].append(value)
             done = term or trunc
             obs = next_obs
         if not ep:
@@ -204,6 +214,10 @@ def update(ac: ActorCritic, opt, transitions: list[Transition], cfg: PPOConfig) 
     gen = torch.Generator().manual_seed(cfg.seed)
     metrics = defaultdict(float)
     policy_stds: list[float] = []
+    # Effective (population-conditioned) exploration std, aggregated over the
+    # update's minibatches — this is what actually varies now that the std is
+    # state-dependent, so it, not just the per-segment base, shows adaptivity.
+    eff_std = {"sum": 0.0, "min": float("inf"), "max": float("-inf"), "n": 0}
     n_batches = 0
 
     for _ in range(cfg.ppo_epochs):
@@ -239,9 +253,14 @@ def update(ac: ActorCritic, opt, transitions: list[Transition], cfg: PPOConfig) 
                     [transitions[i].ret for i in mb], dtype=torch.float32, device=device
                 )
 
-                logp, entropy, value, batch, ctx = ac.evaluate_actions(
+                logp, entropy, value, batch, ctx, std = ac.evaluate_actions(
                     states, source_algo, target_algo, actions, contexts
                 )
+                with torch.no_grad():
+                    eff_std["sum"] += float(std.mean())
+                    eff_std["min"] = min(eff_std["min"], float(std.min()))
+                    eff_std["max"] = max(eff_std["max"], float(std.max()))
+                    eff_std["n"] += 1
                 ratio = (logp - old_logp).exp()
                 surr1 = ratio * adv
                 surr2 = torch.clamp(ratio, 1 - cfg.clip, 1 + cfg.clip) * adv
@@ -297,6 +316,12 @@ def update(ac: ActorCritic, opt, transitions: list[Transition], cfg: PPOConfig) 
     out["policy_std_median"] = float(np.median(stds))
     out["policy_std_min"] = float(stds.min())
     out["policy_std_max"] = float(stds.max())
+    # Effective per-coordinate std (base + population-conditioned residual): its
+    # min/max spread over the update is the visible signature of the adaptivity.
+    if eff_std["n"]:
+        out["policy_std_eff"] = eff_std["sum"] / eff_std["n"]
+        out["policy_std_eff_min"] = eff_std["min"]
+        out["policy_std_eff_max"] = eff_std["max"]
     return out
 
 
@@ -338,7 +363,8 @@ def train_ppo(ac: ActorCritic, envs, cfg: PPOConfig, log_fn=None) -> PPOLog:
         # Report the raw return of the freshly collected episodes only, so the
         # learning curve reflects the current policy (not stale window records).
         m["mean_return"] = float(np.mean(ep_returns)) if ep_returns else 0.0
-        # Per-switch-direction mean reward (relative mode only; empty otherwise).
+        # Per-switch-direction mean reward (relative/noswitch/mixed modes; else
+        # empty), plus the mixed_noswitch / mixed_relative part means in mixed mode.
         for switch, rs in switch_rewards.items():
             m[f"reward/{switch}"] = float(np.mean(rs))
         m["n_transitions"] = len(buffer)

@@ -121,7 +121,30 @@ def pso_utility(mid: CanonicalState, ctx: NormContext) -> Tensor:
     return align + 0.1 * anchor
 
 
-_UTILITY = {"CMAES": cmaes_utility, "PSO": pso_utility}
+def bobyqa_utility(mid: CanonicalState, ctx: NormContext) -> Tensor:
+    """The decoded quadratic model (centred on best_x) should *explain the
+    landscape*: its predicted increase away from the centre must track the
+    population's actual fitnesses. Standardized-MSE between the model's
+    predictions and the standardized objective values, in the normalized frame
+    — BOBYQA's analogue of ``cmaes_utility`` (elites likely under the decoded
+    distribution)."""
+    pos_n = ctx.normalize(mid.positions, Struct.PER_PARTICLE_PER_DIM, True)  # (B,N,D)
+    best_n = ctx.normalize(mid.best_x, Struct.PER_DIM, True)  # (B,D)
+    g = ctx.normalize(mid.specific["grad"], Struct.PER_DIM, False)  # (B,D)
+    H = ctx.normalize(mid.specific["hessian"], Struct.MATRIX, False)  # (B,D,D)
+
+    d = pos_n - best_n.unsqueeze(1)  # (B,N,D) displacement from the model centre
+    lin = (d * g.unsqueeze(1)).sum(-1)  # (B,N)
+    quad = 0.5 * torch.einsum("bnd,bde,bne->bn", d, H, d)  # (B,N)
+    pred = lin + quad  # model value relative to the centre
+
+    val_n = ctx.normalize(mid.values, Struct.PER_PARTICLE, False)  # (B,N) standardized
+    pred = pred - pred.mean(dim=1, keepdim=True)
+    pred = pred / pred.std(dim=1, keepdim=True).clamp_min(1e-6)
+    return torch.mean((pred - val_n) ** 2)
+
+
+_UTILITY = {"CMAES": cmaes_utility, "PSO": pso_utility, "BOBYQA": bobyqa_utility}
 
 
 def utility_loss(mid: CanonicalState, ctx: NormContext) -> Tensor:

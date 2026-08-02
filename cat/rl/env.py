@@ -14,13 +14,21 @@ the next segment.
   side-input to the critic.
 * **action** — the target's full native warm-start dict (shared population +
   decoded specific fields), assembled by the policy from its decoded state.
-* **reward** — depends on ``reward_mode`` (default ``"noswitch"``):
-    - ``noswitch``: similarity of the switched trajectory to a *no-switch*
-      counterfactual (the source optimizer simply continuing). A perfect
-      translation makes the switch invisible, so reward = ``-|Δ best| / range``
-      (0 == identical to not switching).
-    - ``absolute``: log-scaled best-so-far improvement over the segment.
-    - ``relative``: log-scaled improvement over the lossy default hand-off.
+* **reward** — every mode is ``log_scale(translated improvement) −
+  log_scale(baseline improvement)``, differing only in the baseline:
+    - ``absolute``: baseline 0 — log-scaled best-so-far improvement over the
+      segment.
+    - ``relative``: baseline = the *lossy default* hand-off (shared population
+      only) running the same target. Isolates translation quality — what the
+      action controls — independent of whether switching was wise.
+    - ``noswitch``: baseline = the *source optimizer continuing* (no switch)
+      from its full state. Signed switch-worthiness: positive when the switched
+      + translated run outperforms staying, negative when it underperforms.
+      Outperforming the reference is rewarded, not penalized.
+    - ``mixed``: the sum of the ``noswitch`` and ``relative`` rewards — the
+      switch is credited both for being worth making (beating the source
+      continuing) and for being well translated (beating the lossy hand-off).
+      Runs both counterfactual optimizers per step (~3x cost).
   All are scaled by the initial gap to the global optimum (fixed at reset).
 
 The observation/action spaces are declared for completeness but the env is meant
@@ -44,7 +52,7 @@ from cat.state.canonical import warm_start_optimizer
 # maps a [0, 1] scaled improvement to [0, log(1 + 1/eps)] (~6.9 for eps=1e-3),
 # with 0 improvement -> 0. Log scaling emphasizes the small improvements that
 # dominate late-stage refinement near the optimum.
-_REWARD_EPS = 1e-3
+_REWARD_EPS = 1e-4
 
 
 def scaled_improvement(prev_best: float, new_best: float, rng_range: float) -> float:
@@ -82,12 +90,13 @@ class TranslationEnv(gym.Env):
         n_individuals_b: int | None = None,
         reward_mode: str = "relative",
         switch_cdb: float = 1.0,
+        random_start: bool = True,
         seed: int = 0,
     ):
         super().__init__()
         if not problem_ids:
             raise ValueError("problem_ids is empty")
-        if reward_mode not in ("noswitch", "absolute", "relative"):
+        if reward_mode not in ("noswitch", "absolute", "relative", "mixed"):
             raise ValueError(f"unknown reward_mode {reward_mode!r}")
         self.algo_a = algo_a
         self.algo_b = algo_b
@@ -102,6 +111,7 @@ class TranslationEnv(gym.Env):
         self.n_b = n_individuals_b if n_individuals_b is not None else n_individuals
         self.reward_mode = reward_mode
         self.switch_cdb = switch_cdb
+        self.random_start = random_start
         self._seed = seed
         self.dim = self._parse_dim(problem_ids[0])
 
@@ -188,6 +198,15 @@ class TranslationEnv(gym.Env):
         sw_rng = np.random.default_rng(base)
         self._problem_idx += 1
 
+        # Which algorithm does the cold warmup (and thus the whole A,B,A,B parity).
+        # Randomizing it per episode gives *both* translation directions a
+        # balanced mix of early (high-headroom) and late (low-headroom) slots,
+        # instead of A always taking the even steps and B the odd, later ones.
+        if self.random_start and sw_rng.random() < 0.5:
+            start_algo, other_algo = self.algo_b, self.algo_a
+        else:
+            start_algo, other_algo = self.algo_a, self.algo_b
+
         # Agent-independent probe: fixes best/scale before the agent acts.
         n_probe = min(2 * dim + 8, max(self._max_fe // (self.n_switches + 3), dim + 1))
         # The warmup segment must leave room (after the probe) for the source
@@ -213,7 +232,7 @@ class TranslationEnv(gym.Env):
         self._n_fe = n_probe
 
         # Warm up the first algorithm (cold) to build a genuine source state.
-        warmup = self._make_optimizer(self.algo_a, self._checkpoints[0], base + 1)
+        warmup = self._make_optimizer(start_algo, self._checkpoints[0], base + 1)
         warmup.set_data(best_x=self._best_x, best_y=self._best_y)
         result = warmup.optimize()
         self._update_best(result)
@@ -230,8 +249,8 @@ class TranslationEnv(gym.Env):
             self._range = max(float(np.median(y_probe)) - self._best_y, 1e-5)
 
         self._src_native = _augment(warmup, dim)
-        self._src_algo = self.algo_a
-        self._tgt_algo = self.algo_b
+        self._src_algo = start_algo
+        self._tgt_algo = other_algo
         self._step_idx = 0
         return self._observation(), {"problem_id": pid, "dimension": dim}
 
@@ -252,28 +271,36 @@ class TranslationEnv(gym.Env):
         # is constructed from the same pre-segment best / FE count.
         rng = max(self._range, 1e-12)
         translated_scaled = float(np.clip(translated_improvement / rng, 0.0, 1.0))
+        translated_term = _log_scale(translated_scaled)
+
+        # Each baseline is a counterfactual improvement, log-scaled the same way
+        # as the translated run; the mode selects which reference(s) to subtract.
+        #   noswitch: the *source* optimizer continuing (no switch) from its full
+        #     state over the same segment — a REFERENCE, not a trajectory to
+        #     imitate. Signed: outperforming it is rewarded, underperforming is
+        #     penalized, but a genuinely better switch is *not* punished for
+        #     deviating (unlike the old -|Δ| form).
+        #   relative: the same target run from the *lossy* default hand-off
+        #     (shared population only, same seed). Isolates exactly what the
+        #     action controls — translation quality, independent of whether
+        #     switching was wise.
+        #   mixed: both of the above summed — rewards a switch that is both
+        #     worth making (beats the source continuing) and well translated
+        #     (beats the lossy hand-off). Runs both counterfactual optimizers.
+        reward_parts: dict[str, float] | None = None
         if self.reward_mode == "noswitch":
-            # Counterfactual: continue the *source* optimizer (no switch) from its
-            # own full state over the same segment. Reward closeness of the
-            # switched trajectory's performance to that no-switch performance, so
-            # a perfect translation makes the switch effectively invisible.
-            noswitch_best = self._noswitch_best(target_fe, seg_seed)
-            diff = abs(new_best - noswitch_best)
-            reward = -float(
-                np.clip(diff / rng, 0.0, 1.0)
-            )  # 0 == identical to no-switch
+            reward = translated_term - self._noswitch_term(target_fe, seg_seed, prev_best, rng)
         elif self.reward_mode == "relative":
-            # Counterfactual: run the same target from the *lossy* default hand-off
-            # over the same segment (same seed) and reward how much the
-            # translated state beat it (in log-scaled units). Isolates exactly
-            # what the action controls.
-            base_improvement = self._baseline_improvement(
-                target, target_fe, seg_seed, prev_best
-            )
-            base_scaled = float(np.clip(base_improvement / rng, 0.0, 1.0))
-            reward = _log_scale(translated_scaled) - _log_scale(base_scaled)
+            reward = translated_term - self._relative_term(target, target_fe, seg_seed, prev_best, rng)
+        elif self.reward_mode == "mixed":
+            noswitch = translated_term - self._noswitch_term(target_fe, seg_seed, prev_best, rng)
+            relative = translated_term - self._relative_term(target, target_fe, seg_seed, prev_best, rng)
+            reward = noswitch + relative
+            # Expose the two additive components so the trainers can log each
+            # part's mean separately (reward/mixed_noswitch, reward/mixed_relative).
+            reward_parts = {"mixed_noswitch": noswitch, "mixed_relative": relative}
         else:  # absolute
-            reward = _log_scale(translated_scaled)
+            reward = translated_term
 
         # Now advance the episode: the target's resulting state becomes the
         # next source; roles swap.
@@ -286,9 +313,28 @@ class TranslationEnv(gym.Env):
 
         terminated = self._step_idx >= self.n_switches
         info = {"best_y": self._best_y, "n_fe": self._n_fe, "reward": reward}
+        if reward_parts is not None:
+            info["reward_parts"] = reward_parts
         obs = self._observation()
         # The next observation is valid only if there is another step to take.
         return obs, reward, terminated, False, info
+
+    def _noswitch_term(self, target_fe, seg_seed, prev_best, rng) -> float:
+        """Log-scaled improvement of the *source* optimizer continuing (no switch)
+        from its own full state over the same segment — the 'noswitch' reference.
+        Does not advance the episode."""
+        best = self._noswitch_best(target_fe, seg_seed)
+        base_improvement = max(0.0, prev_best - best)
+        return _log_scale(float(np.clip(base_improvement / rng, 0.0, 1.0)))
+
+    def _relative_term(self, target, target_fe, seg_seed, prev_best, rng) -> float:
+        """Log-scaled improvement of the *lossy* default hand-off (shared
+        population only) running the same target over the same segment — the
+        'relative' reference. Does not advance the episode."""
+        base_improvement = self._baseline_improvement(
+            target, target_fe, seg_seed, prev_best
+        )
+        return _log_scale(float(np.clip(base_improvement / rng, 0.0, 1.0)))
 
     def _noswitch_best(self, target_fe, seg_seed) -> float:
         """Best-so-far the *source* optimizer would reach if it simply continued

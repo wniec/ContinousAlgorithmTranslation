@@ -93,8 +93,14 @@ def test_relative_reward_zero_for_lossy_action():
         done = term or trunc
 
 
-def test_noswitch_reward_bounds_and_sign():
-    """noswitch reward = -|switched - no-switch| / range, in [-1, 0]."""
+def test_noswitch_reward_is_signed_over_source_continuing():
+    """noswitch reward = log_scale(translated_impr) - log_scale(source_continuing_impr):
+    a *signed* difference of logs against the source-continuing reference, NOT the
+    old symmetric -|Δ| penalty. It must be finite, bounded by the log-scale range,
+    and able to go strictly negative (a lossy switch usually underperforms the
+    source simply continuing)."""
+    from cat.rl.env import _log_scale
+
     env = TranslationEnv(
         "PSO",
         "CMAES",
@@ -106,17 +112,61 @@ def test_noswitch_reward_bounds_and_sign():
         reward_mode="noswitch",
         seed=5,
     )
+    bound = _log_scale(1.0)  # each log-scale term is in [0, bound]
     obs, _ = env.reset()
     done = False
-    seen_nonzero = False
+    seen_negative = False
     while not done:
         obs, r, term, trunc, _ = env.step(_lossy_action(obs))
-        assert -1.0 - 1e-9 <= r <= 1e-9  # in [-1, 0]
-        seen_nonzero = seen_nonzero or r < -1e-9
+        assert np.isfinite(r)
+        assert -bound - 1e-9 <= r <= bound + 1e-9
+        seen_negative = seen_negative or r < -1e-9
         done = term or trunc
-    # A lossy hand-off generally does NOT reproduce continuing the source, so at
-    # least one step should be penalized (reward strictly below 0).
-    assert seen_nonzero
+    # A lossy switch generally underperforms the source continuing at some step.
+    assert seen_negative
+
+
+def test_mixed_reward_is_noswitch_plus_relative():
+    """'mixed' mode is defined as the sum of the noswitch and relative rewards.
+    Driving three identically-seeded envs with the same lossy action must give,
+    at every step, mixed == noswitch + relative (the counterfactual optimizers
+    are seeded deterministically per segment, so the terms match exactly)."""
+
+    def _make(mode):
+        return TranslationEnv(
+            "PSO",
+            "CMAES",
+            build_problem_ids({1, 2}, dims=[2], instances=[1]),
+            IOHSuite(),
+            fe_multiplier=300,
+            n_switches=4,
+            n_individuals=12,
+            reward_mode=mode,
+            seed=7,
+        )
+
+    envs = {m: _make(m) for m in ("noswitch", "relative", "mixed")}
+    obs = {m: e.reset()[0] for m, e in envs.items()}
+    done = False
+    saw_step = False
+    while not done:
+        rs, infos = {}, {}
+        for m, e in envs.items():
+            obs[m], rs[m], term, trunc, infos[m] = e.step(_lossy_action(obs[m]))
+        assert np.isclose(rs["mixed"], rs["noswitch"] + rs["relative"], atol=1e-9)
+        # mixed mode exposes the two additive components in info, and they must
+        # sum to the reward and match each single-baseline mode's reward.
+        parts = infos["mixed"]["reward_parts"]
+        assert np.isclose(parts["mixed_noswitch"], rs["noswitch"], atol=1e-9)
+        assert np.isclose(parts["mixed_relative"], rs["relative"], atol=1e-9)
+        assert np.isclose(
+            parts["mixed_noswitch"] + parts["mixed_relative"], rs["mixed"], atol=1e-9
+        )
+        # single-baseline modes carry no reward_parts.
+        assert "reward_parts" not in infos["noswitch"]
+        saw_step = True
+        done = term or trunc
+    assert saw_step
 
 
 def test_log_scaled_reward_properties():
@@ -131,7 +181,9 @@ def test_log_scaled_reward_properties():
     # full-range improvement saturates at log(1 + 1/eps).
     import math
 
-    assert math.isclose(_log_scale(1.0), math.log(1 + 1000.0), rel_tol=1e-6)
+    from cat.rl.env import _REWARD_EPS
+
+    assert math.isclose(_log_scale(1.0), math.log(1 + 1 / _REWARD_EPS), rel_tol=1e-6)
 
 
 def test_range_uses_distance_to_optimum():

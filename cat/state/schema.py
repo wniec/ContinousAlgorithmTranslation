@@ -122,6 +122,24 @@ MADDE_SPEC = StateSpec(
 )
 
 
+# BOBYQA (model-based trust region) translates its local quadratic surrogate,
+# centred on the current best point: the model gradient ``grad`` and Hessian
+# ``hessian`` (its analogue of CMA-ES's covariance — curvature of the local
+# model rather than a sampling shape), plus the trust-region radius ``radius``
+# (its step-scale analogue of CMA-ES's sigma). The interpolation set itself is
+# the shared population (positions/values), so it is carried, not translated.
+# ``hessian`` decodes through the PSD covariance head — a convex local model,
+# which is the correct inductive bias for a *local* optimizer near a minimum.
+BOBYQA_SPEC = StateSpec(
+    algo="BOBYQA",
+    specific=(
+        Field("grad", Struct.PER_DIM, "grad", weight=0.5),
+        Field("hessian", Struct.MATRIX, "hessian", weight=1.0),
+        Field("radius", Struct.SCALAR, "radius", Constraint.POSITIVE, weight=1.0),
+    ),
+)
+
+
 _SPECS: dict[str, StateSpec] = {
     "PSO": PSO_SPEC,
     "SPSO": PSO_SPEC,
@@ -129,6 +147,7 @@ _SPECS: dict[str, StateSpec] = {
     "CPSO": PSO_SPEC,
     "CMAES": CMAES_SPEC,
     "MADDE": MADDE_SPEC,
+    "BOBYQA": BOBYQA_SPEC,
 }
 
 

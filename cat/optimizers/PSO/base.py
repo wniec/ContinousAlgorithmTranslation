@@ -122,12 +122,15 @@ class PSO(SubOptimizer):
                     return arr[idx]
                 return fallback()
 
-            v = _reindexed(
-                "v",
-                lambda: self.rng_initialization.uniform(
-                    self._min_v, self._max_v, self._shape
-                ),
-            )
+            # A population hand-off *without* velocities (the lossy default, or a
+            # non-PSO source) starts the swarm at rest, NOT with random velocity.
+            # Random dispersal velocity flings an already-converged inherited
+            # swarm off its good point, making the lossy baseline pathologically
+            # weak — so the relative reward for any ``* -> PSO`` switch could
+            # never go negative (translated, near-zero velocities always beat it).
+            # Zero is the neutral hand-off; a *cold* start (empty warm-start ->
+            # ``initialize``) still uses random velocity, standard PSO.
+            v = _reindexed("v", lambda: np.zeros(self._shape))
             p_x = _reindexed("p_x", lambda: np.copy(x_sub))
             p_y = _reindexed("p_y", lambda: np.copy(y_sub))
             n_x = _reindexed("n_x", lambda: np.copy(x_sub))

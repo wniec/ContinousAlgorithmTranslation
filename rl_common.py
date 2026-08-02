@@ -54,12 +54,15 @@ def add_env_args(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--reward-mode",
-        choices=["noswitch", "absolute", "relative"],
+        choices=["noswitch", "absolute", "relative", "mixed"],
         default="noswitch",
-        help="'noswitch' (default) rewards matching the no-switch counterfactual "
-        "(the source optimizer continuing); 'absolute' rewards raw improvement; "
-        "'relative' rewards improvement over the lossy default. noswitch/relative "
-        "run an extra counterfactual optimizer per step (~2x cost).",
+        help="every mode is log_scale(translated) - log_scale(baseline). "
+        "'noswitch' (default) baseline = the source optimizer continuing "
+        "(signed switch-worthiness: + if the switch beats staying, - if worse); "
+        "'absolute' baseline = 0 (raw improvement); 'relative' baseline = the "
+        "lossy default hand-off (translation quality); 'mixed' = noswitch + "
+        "relative summed. noswitch/relative run one extra counterfactual "
+        "optimizer per step (~2x cost); mixed runs both (~3x cost).",
     )
 
 

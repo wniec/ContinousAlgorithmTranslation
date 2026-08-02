@@ -23,7 +23,7 @@ from torch import Tensor, nn
 from torch.distributions import Normal
 
 from cat.data.dataset import collate
-from cat.models.encoder import StateEncoder
+from cat.models.encoder import Latent, StateEncoder
 from cat.models.layers import MLP
 from cat.models.norm import NormContext
 from cat.models.translator import TranslatorPair
@@ -83,15 +83,14 @@ class ActorCritic(nn.Module):
             {a: StateEncoder(a, hidden, n_layers) for a in (algo_a, algo_b)}
         )
         self.critic = MLP([hidden + CONTEXT_DIM, hidden, 1])
-        # One log-std *per action segment per target algorithm*, not one global
-        # scalar. A single scalar forces one exploration scale onto fields with
-        # very different natural magnitudes (CMA-ES's sigma vs. its covariance
-        # factor vs. PSO's per-particle velocities) and makes the logged
-        # min/median/max std degenerate — there is nothing for them to range
-        # over. Per-*element* stds are impossible here (the action dimension
-        # varies with D and N), but the segment list is fixed per algorithm
-        # (StateDecoder.segment_names), so this is the finest shape-invariant
-        # granularity available.
+        # Exploration std = a per-segment *base* (below) plus a per-dimension,
+        # population-conditioned residual (the std heads that follow). The base
+        # is one log-std per action segment per target algorithm: a single
+        # scalar would force one exploration scale onto fields of very different
+        # natural magnitude (CMA-ES's sigma vs. its covariance factor vs. PSO's
+        # velocities); per-*element* static params are impossible (the action
+        # dim varies with D and N), so the segment is the finest shape-invariant
+        # static granularity.
         self.log_std = nn.ParameterDict(
             {
                 a: nn.Parameter(
@@ -103,16 +102,80 @@ class ActorCritic(nn.Module):
                 for a in (algo_a, algo_b)
             }
         )
+        # Per-dimension, coordinate-equivariant std residual. Each D-indexed
+        # segment (grad / velocities / archive / covariance factor+diagonal)
+        # gets its *own* log-std per dimension-token, read from the encoder
+        # latent — so the exploration scale actually adapts to the population
+        # (and permutes with the coordinate axes, keeping the policy
+        # equivariant). Scalar segments (e.g. BOBYQA's radius) read one residual
+        # from the global vector. Zero-initialised, so training starts exactly
+        # at the per-segment base (``exp(log_std)``) and *learns* the modulation.
+        self.std_token_head = nn.ModuleDict()
+        self.std_global_head = nn.ModuleDict()
+        for a in (algo_a, algo_b):
+            names = self.translator.decoders[a].segment_names()
+            n_dim_seg = sum(1 for nm in names if nm != "scalar")
+            head = nn.Linear(hidden, n_dim_seg)
+            nn.init.zeros_(head.weight)
+            nn.init.zeros_(head.bias)
+            self.std_token_head[a] = head
+            if any(nm == "scalar" for nm in names):
+                g = nn.Linear(hidden, 1)
+                nn.init.zeros_(g.weight)
+                nn.init.zeros_(g.bias)
+                self.std_global_head[a] = g
         self.algo_a = algo_a
         self.algo_b = algo_b
 
-    def action_std(self, target_algo: str, d: int, n: int) -> Tensor:
-        """Per-coordinate std, shape ``(action_dim(d, n),)`` — each segment's own
-        log-std broadcast across the coordinates it owns."""
+    # Where the ``D`` (dimension-token) axis sits inside each segment's
+    # per-sample shape, so a per-dimension std broadcasts onto it and over the
+    # remaining (particle / rank / field) axes.
+    _D_AXIS = {"pd": 0, "cov_L": 0, "cov_d": 0, "ppd": 1, "set": 1}
+    _STD_DELTA = 1.0  # residual half-range in log-space: std in (e^-1, e^1)*base
+
+    @staticmethod
+    def _broadcast_dim(v: Tensor, shape: tuple[int, ...], d_axis: int) -> Tensor:
+        """Place a per-dimension vector ``v`` (B, D) onto axis ``d_axis`` of a
+        segment shaped ``(B, *shape)`` and broadcast over the other axes."""
+        B, D = v.shape
+        view = [1] * len(shape)
+        view[d_axis] = D
+        return v.reshape(B, *view).expand(B, *shape)
+
+    def action_std(self, target_algo: str, z: "Latent", n: int) -> Tensor:
+        """Per-coordinate std, shape ``(B, action_dim(D, n))``.
+
+        Each segment's std is its learnable base plus a bounded, population-
+        conditioned residual: per dimension-token for the D-indexed segments
+        (read from ``z.dim_tokens``), one global residual for scalar segments
+        (from ``z.global_vec``). Following the decoder's own segment layout and
+        flattening keeps the ordering aligned with ``action_mean``."""
         dec = self.translator.decoders[target_algo]
-        log_std = self.log_std[target_algo]
-        sizes = torch.tensor(dec.segment_sizes(d, n), device=log_std.device)
-        return log_std.repeat_interleave(sizes).exp()
+        B, D, _ = z.dim_tokens.shape
+        base = self.log_std[target_algo]
+        names = dec.segment_names()
+        base_idx = {nm: i for i, nm in enumerate(names)}
+        dim_col = {nm: k for k, nm in enumerate(nm for nm in names if nm != "scalar")}
+
+        tok_delta = self.std_token_head[target_algo](z.dim_tokens)  # (B, D, n_dim_seg)
+
+        parts: list[Tensor] = []
+        for name, shape in dec._layout(D, n):
+            size = 1
+            for s in shape:
+                size *= s
+            if name == "scalar":
+                g = self.std_global_head[target_algo](z.global_vec)[:, 0]  # (B,)
+                val = base[base_idx[name]] + self._STD_DELTA * torch.tanh(g)
+                chunk = val.reshape(B, 1).expand(B, size)
+            else:
+                per_dim = base[base_idx[name]] + self._STD_DELTA * torch.tanh(
+                    tok_delta[:, :, dim_col[name]]
+                )  # (B, D)
+                chunk = self._broadcast_dim(per_dim, shape, self._D_AXIS[name])
+                chunk = chunk.reshape(B, size)
+            parts.append(chunk)
+        return torch.cat(parts, dim=-1).exp()  # (B, action_dim)
 
     def _value(self, source_algo: str, batch, ctx, context: Tensor) -> Tensor:
         zc = self.critic_encoders[source_algo](batch, ctx)
@@ -141,7 +204,7 @@ class ActorCritic(nn.Module):
 
         z = self.translator.encode(batch, ctx)
         mean = self.translator.decoders[target].action_mean(z, batch.positions, ctx)
-        std = self.action_std(target, batch.d, batch.n)
+        std = self.action_std(target, z, batch.n)
         dist = Normal(mean, std)
         action = mean if deterministic else dist.rsample()
         log_prob = dist.log_prob(action).sum(-1)
@@ -193,8 +256,9 @@ class ActorCritic(nn.Module):
     ):
         """Recompute log-prob / entropy / value for a homogeneous group.
 
-        Returns (log_prob, entropy, value, batch, ctx) — the batched state and
-        ctx are reused by the cycle-consistency auxiliary loss.
+        Returns (log_prob, entropy, value, batch, ctx, std) — the batched state
+        and ctx are reused by the cycle-consistency auxiliary loss; ``std`` is
+        the effective (population-conditioned) per-coordinate std, for logging.
         """
         batch = collate(states)
         ctx = _ctx(batch)
@@ -202,12 +266,12 @@ class ActorCritic(nn.Module):
         mean = self.translator.decoders[target_algo].action_mean(
             z, batch.positions, ctx
         )
-        std = self.action_std(target_algo, batch.d, batch.n)
+        std = self.action_std(target_algo, z, batch.n)
         dist = Normal(mean, std)
         log_prob = dist.log_prob(actions).sum(-1)
         entropy = dist.entropy().sum(-1)
         value = self._value(source_algo, batch, ctx, contexts)
-        return log_prob, entropy, value, batch, ctx
+        return log_prob, entropy, value, batch, ctx, std
 
     def cycle_drift(
         self, batch: CanonicalState, ctx: NormContext, cycle_mode: str = "field"
